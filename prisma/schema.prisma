@@ -1,0 +1,61 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model EmailLog {
+  id        String    @id @default(uuid())
+  to        String
+  from      String
+  subject   String
+  template  String
+  status    String    @default("queued") // queued, sending, sent, delivered, bounced, complained, failed
+  resendId  String?
+  tenantId  String?
+  metadata  Json?
+  error     String?
+  attempts  Int       @default(0)
+  sentAt    DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([tenantId])
+  @@index([status])
+  @@index([template])
+  @@index([createdAt])
+  @@index([resendId])
+}
+
+model WebhookDelivery {
+  id          String   @id @default(uuid())
+  emailLogId  String
+  targetUrl   String
+  event       String   // email.bounced, email.complained, email.delivered
+  payload     Json
+  status      String   @default("pending") // pending, sent, failed
+  attempts    Int      @default(0)
+  lastError   String?
+  sentAt      DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([emailLogId])
+  @@index([status])
+}
+
+model TenantEmailConfig {
+  id             String   @id @default(uuid())
+  tenantId       String   @unique
+  fromEmail      String?  // e.g., support@acme-msp.com
+  fromName       String?  // e.g., Acme MSP Support
+  replyTo        String?
+  domain         String?  // e.g., acme-msp.com
+  domainVerified Boolean  @default(false)
+  resendDomainId String?  // Resend's domain ID once verified
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
