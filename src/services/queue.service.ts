@@ -1,7 +1,7 @@
 import { PrismaClient } from '@prisma/client';
 import { ResendService } from './resend.service';
 import { WebhookService } from './webhook.service';
-import { getTemplate } from '../config/templates';
+import { TemplateService } from './template.service';
 
 export interface QueuedEmail {
   id: string;
@@ -21,6 +21,7 @@ export class QueueService {
   private prisma: PrismaClient;
   private resendService: ResendService;
   private webhookService: WebhookService;
+  private templateService: TemplateService;
   private queue: QueuedEmail[] = [];
   private processing = false;
   private intervalId: NodeJS.Timeout | null = null;
@@ -29,19 +30,24 @@ export class QueueService {
     this.prisma = prisma;
     this.resendService = new ResendService(prisma);
     this.webhookService = new WebhookService(prisma);
+    this.templateService = new TemplateService(prisma);
   }
 
   /**
    * Add email to the queue and return immediately
    */
   async enqueue(email: Omit<QueuedEmail, 'id'>): Promise<string> {
-    const template = getTemplate(email.template);
-    if (!template) {
+    // Get template from database (tenant-specific or system default)
+    const rendered = await this.templateService.getAndRender(
+      email.template,
+      email.data,
+      email.tenantId
+    );
+
+    if (!rendered) {
       throw new Error(`Template not found: ${email.template}`);
     }
 
-    // Render the template
-    const rendered = template.render(email.data);
     const from = email.from || process.env.EMAIL_FROM || 'noreply@example.com';
 
     // Create log entry
@@ -121,13 +127,17 @@ export class QueueService {
    * Send a single email with retry logic
    */
   private async sendEmail(email: QueuedEmail): Promise<void> {
-    const template = getTemplate(email.template);
-    if (!template) {
+    // Get template from database (tenant-specific or system default)
+    const rendered = await this.templateService.getAndRender(
+      email.template,
+      email.data,
+      email.tenantId
+    );
+
+    if (!rendered) {
       await this.markFailed(email.id, `Template not found: ${email.template}`);
       return;
     }
-
-    const rendered = template.render(email.data);
 
     // Update status to sending
     await this.prisma.emailLog.update({

@@ -3,6 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { PrismaClient } from '@prisma/client';
 import emailRoutes from './routes/email.routes';
+import domainRoutes from './routes/domain.routes';
 import { QueueService } from './services/queue.service';
 
 dotenv.config();
@@ -51,6 +52,7 @@ app.get('/health', async (req, res) => {
 
 // API routes
 app.use('/api', emailRoutes);
+app.use('/api/domains', domainRoutes);
 
 // Error handling
 app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {

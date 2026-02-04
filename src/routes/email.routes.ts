@@ -2,7 +2,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { PrismaClient } from '@prisma/client';
 import { QueueService } from '../services/queue.service';
 import { WebhookService } from '../services/webhook.service';
-import { getTemplate, listTemplates } from '../config/templates';
+import { TemplateService } from '../services/template.service';
 
 const router = Router();
 
@@ -32,6 +32,8 @@ router.use((req, res, next) => {
  */
 router.post('/send', async (req: Request, res: Response) => {
   try {
+    const prisma: PrismaClient = req.app.locals.prisma;
+    const templateService = new TemplateService(prisma);
     const { to, template, data, tenantId, from, replyTo } = req.body;
 
     // Validation
@@ -42,12 +44,13 @@ router.post('/send', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Missing required field: template' });
     }
 
-    // Check template exists
-    const templateObj = getTemplate(template);
+    // Check template exists (tenant-specific or system default)
+    const templateObj = await templateService.getTemplate(template, tenantId);
     if (!templateObj) {
+      const allTemplates = await templateService.listSystemTemplates();
       return res.status(400).json({
         error: `Template not found: ${template}`,
-        availableTemplates: listTemplates(),
+        availableTemplates: allTemplates.map((t) => ({ name: t.name, displayName: t.displayName })),
       });
     }
 
@@ -211,36 +214,214 @@ router.get('/logs', async (req: Request, res: Response) => {
 
 /**
  * GET /api/templates
- * List available email templates
+ * List all templates (system + tenant's custom)
  */
-router.get('/templates', (req: Request, res: Response) => {
-  res.json({
-    templates: listTemplates(),
-  });
+router.get('/templates', async (req: Request, res: Response) => {
+  try {
+    const prisma: PrismaClient = req.app.locals.prisma;
+    const templateService = new TemplateService(prisma);
+    const { tenantId } = req.query;
+
+    const templates = await templateService.listTemplates(tenantId as string);
+
+    res.json({
+      templates: templates.map((t) => ({
+        id: t.id,
+        name: t.name,
+        displayName: t.displayName,
+        description: t.description,
+        isSystem: t.isSystem,
+        tenantId: t.tenantId,
+        variables: t.variables,
+        createdAt: t.createdAt,
+        updatedAt: t.updatedAt,
+      })),
+    });
+  } catch (error) {
+    console.error('Error listing templates:', error);
+    res.status(500).json({ error: 'Failed to list templates' });
+  }
 });
 
 /**
- * GET /api/templates/:name/preview
+ * GET /api/templates/:name
+ * Get a specific template by name (tenant-specific or system default)
+ */
+router.get('/templates/:name', async (req: Request, res: Response) => {
+  try {
+    const prisma: PrismaClient = req.app.locals.prisma;
+    const templateService = new TemplateService(prisma);
+    const { name } = req.params;
+    const { tenantId } = req.query;
+
+    const template = await templateService.getTemplate(name, tenantId as string);
+
+    if (!template) {
+      return res.status(404).json({ error: `Template not found: ${name}` });
+    }
+
+    res.json({
+      id: template.id,
+      name: template.name,
+      displayName: template.displayName,
+      description: template.description,
+      subject: template.subject,
+      htmlBody: template.htmlBody,
+      textBody: template.textBody,
+      variables: template.variables,
+      isSystem: template.isSystem,
+      tenantId: template.tenantId,
+      createdAt: template.createdAt,
+      updatedAt: template.updatedAt,
+    });
+  } catch (error) {
+    console.error('Error fetching template:', error);
+    res.status(500).json({ error: 'Failed to fetch template' });
+  }
+});
+
+/**
+ * POST /api/templates
+ * Create a custom template (requires tenantId)
+ */
+router.post('/templates', async (req: Request, res: Response) => {
+  try {
+    const prisma: PrismaClient = req.app.locals.prisma;
+    const templateService = new TemplateService(prisma);
+    const { tenantId, name, displayName, description, subject, htmlBody, textBody, variables } =
+      req.body;
+
+    if (!tenantId) {
+      return res.status(400).json({ error: 'tenantId is required for custom templates' });
+    }
+    if (!name) {
+      return res.status(400).json({ error: 'name is required' });
+    }
+    if (!displayName) {
+      return res.status(400).json({ error: 'displayName is required' });
+    }
+    if (!subject) {
+      return res.status(400).json({ error: 'subject is required' });
+    }
+    if (!htmlBody) {
+      return res.status(400).json({ error: 'htmlBody is required' });
+    }
+
+    const template = await templateService.createTemplate(tenantId, {
+      name,
+      displayName,
+      description,
+      subject,
+      htmlBody,
+      textBody,
+      variables,
+    });
+
+    res.status(201).json({
+      id: template.id,
+      name: template.name,
+      displayName: template.displayName,
+      tenantId: template.tenantId,
+      createdAt: template.createdAt,
+    });
+  } catch (error: any) {
+    console.error('Error creating template:', error);
+    if (error.code === 'P2002') {
+      return res.status(409).json({ error: 'Template with this name already exists for this tenant' });
+    }
+    res.status(500).json({ error: 'Failed to create template' });
+  }
+});
+
+/**
+ * PUT /api/templates/:id
+ * Update a custom template
+ */
+router.put('/templates/:id', async (req: Request, res: Response) => {
+  try {
+    const prisma: PrismaClient = req.app.locals.prisma;
+    const templateService = new TemplateService(prisma);
+    const { id } = req.params;
+    const { displayName, description, subject, htmlBody, textBody, variables, isActive } = req.body;
+
+    const template = await templateService.updateTemplate(id, {
+      displayName,
+      description,
+      subject,
+      htmlBody,
+      textBody,
+      variables,
+      isActive,
+    });
+
+    if (!template) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+
+    res.json({
+      id: template.id,
+      name: template.name,
+      displayName: template.displayName,
+      tenantId: template.tenantId,
+      updatedAt: template.updatedAt,
+    });
+  } catch (error: any) {
+    console.error('Error updating template:', error);
+    if (error.message === 'Cannot modify system templates') {
+      return res.status(403).json({ error: error.message });
+    }
+    res.status(500).json({ error: 'Failed to update template' });
+  }
+});
+
+/**
+ * DELETE /api/templates/:id
+ * Delete a custom template (not system ones)
+ */
+router.delete('/templates/:id', async (req: Request, res: Response) => {
+  try {
+    const prisma: PrismaClient = req.app.locals.prisma;
+    const templateService = new TemplateService(prisma);
+    const { id } = req.params;
+
+    const deleted = await templateService.deleteTemplate(id);
+
+    if (!deleted) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+
+    res.json({ success: true, message: 'Template deleted' });
+  } catch (error: any) {
+    console.error('Error deleting template:', error);
+    if (error.message === 'Cannot delete system templates') {
+      return res.status(403).json({ error: error.message });
+    }
+    res.status(500).json({ error: 'Failed to delete template' });
+  }
+});
+
+/**
+ * POST /api/templates/:name/preview
  * Preview a template with sample data
  */
-router.get('/templates/:name/preview', (req: Request, res: Response) => {
-  const { name } = req.params;
-  const template = getTemplate(name);
-
-  if (!template) {
-    return res.status(404).json({
-      error: `Template not found: ${name}`,
-      availableTemplates: listTemplates(),
-    });
-  }
-
-  // Use sample data for preview
-  const sampleData = req.query.data
-    ? JSON.parse(req.query.data as string)
-    : template.sampleData || {};
-
+router.post('/templates/:name/preview', async (req: Request, res: Response) => {
   try {
-    const rendered = template.render(sampleData);
+    const prisma: PrismaClient = req.app.locals.prisma;
+    const templateService = new TemplateService(prisma);
+    const { name } = req.params;
+    const { tenantId, data } = req.body;
+
+    const template = await templateService.getTemplate(name, tenantId);
+
+    if (!template) {
+      return res.status(404).json({ error: `Template not found: ${name}` });
+    }
+
+    // Use provided data or generate sample data from variables
+    const sampleData = data || generateSampleData(template.variables as any[]);
+
+    const rendered = templateService.renderTemplate(template, sampleData);
+
     res.json({
       template: name,
       subject: rendered.subject,
@@ -250,9 +431,24 @@ router.get('/templates/:name/preview', (req: Request, res: Response) => {
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    console.error('Error previewing template:', error);
     res.status(500).json({ error: `Failed to render template: ${errorMessage}` });
   }
 });
+
+/**
+ * Generate sample data from template variables
+ */
+function generateSampleData(variables: { name: string; example: string }[]): Record<string, string> {
+  if (!Array.isArray(variables)) return {};
+  return variables.reduce(
+    (acc, v) => {
+      acc[v.name] = v.example || `{{${v.name}}}`;
+      return acc;
+    },
+    {} as Record<string, string>
+  );
+}
 
 /**
  * POST /api/webhooks/resend
