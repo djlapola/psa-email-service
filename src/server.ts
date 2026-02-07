@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import { PrismaClient } from '@prisma/client';
 import emailRoutes from './routes/email.routes';
 import domainRoutes from './routes/domain.routes';
+import inboundRoutes from './routes/inbound.routes';
 import { QueueService } from './services/queue.service';
 
 dotenv.config();
@@ -20,6 +21,7 @@ app.use(cors());
 
 // Raw body for webhook signature verification
 app.use('/api/webhooks/resend', express.raw({ type: 'application/json' }));
+app.use('/api/inbound/webhook', express.raw({ type: 'application/json' }));
 
 // JSON body for other routes
 app.use(express.json());
@@ -53,6 +55,7 @@ app.get('/health', async (req, res) => {
 // API routes
 app.use('/api', emailRoutes);
 app.use('/api/domains', domainRoutes);
+app.use('/api/inbound', inboundRoutes);
 
 // Error handling
 app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {

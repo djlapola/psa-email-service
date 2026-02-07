@@ -12,6 +12,7 @@ export interface SendEmailOptions {
   replyTo?: string;
   tenantId?: string;
   tags?: { name: string; value: string }[];
+  headers?: Record<string, string>;
 }
 
 export interface SendEmailResult {
@@ -90,6 +91,7 @@ export class ResendService {
         text: options.text,
         reply_to: replyTo,
         tags: options.tags,
+        headers: options.headers,
       });
 
       if (result.error) {

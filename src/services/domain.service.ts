@@ -19,6 +19,8 @@ interface DomainStatus {
   status: 'not_started' | 'pending' | 'verified' | 'failed' | 'not_provisioned';
   dnsRecordsCreated: boolean;
   lastChecked: Date | null;
+  receivingEnabled: boolean;
+  receivingVerified: boolean;
 }
 
 class DomainService {
@@ -46,12 +48,12 @@ class DomainService {
     console.log(`[DomainService] Provisioning domain: ${fullDomain} for tenant: ${tenantId}`);
 
     try {
-      // Step 1: Create domain in Resend
-      console.log(`[DomainService] Creating domain in Resend...`);
+      // Step 1: Create domain in Resend with sending AND receiving enabled
+      console.log(`[DomainService] Creating domain in Resend with sending and receiving...`);
       const resendResult = await resend.domains.create({
         name: fullDomain,
         region: 'us-east-1',
-      });
+      } as any); // Note: capabilities are set via separate API call after creation
 
       if (resendResult.error) {
         console.error(`[DomainService] Resend error:`, resendResult.error);
@@ -64,11 +66,43 @@ class DomainService {
       const resendDomain = resendResult.data!;
       console.log(`[DomainService] Resend domain created: ${resendDomain.id}`);
 
-      // Step 2: Add DNS records to Cloudflare
+      // Step 1b: Enable receiving capability via PATCH
+      console.log(`[DomainService] Enabling receiving capability...`);
+      let receivingEnabled = false;
+      let domainRecords = resendDomain.records;
+
+      try {
+        const updateResponse = await fetch(`https://api.resend.com/domains/${resendDomain.id}`, {
+          method: 'PATCH',
+          headers: {
+            'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ receiving: 'enabled' }),
+        });
+
+        if (updateResponse.ok) {
+          receivingEnabled = true;
+          console.log(`[DomainService] Receiving enabled for domain`);
+
+          // Fetch updated domain info to get MX records
+          const domainInfo = await resend.domains.get(resendDomain.id);
+          if (domainInfo.data?.records) {
+            domainRecords = domainInfo.data.records;
+          }
+        } else {
+          const errorText = await updateResponse.text();
+          console.warn(`[DomainService] Failed to enable receiving: ${errorText}`);
+        }
+      } catch (err) {
+        console.warn(`[DomainService] Error enabling receiving:`, err);
+      }
+
+      // Step 2: Add DNS records to Cloudflare (including MX if receiving enabled)
       console.log(`[DomainService] Adding DNS records to Cloudflare...`);
       const dnsResult = await cloudflareService.addTenantDnsRecords(
         subdomain,
-        resendDomain.records.map((r) => ({
+        domainRecords.map((r: any) => ({
           record: r.record,
           name: r.name,
           type: r.type,
@@ -94,12 +128,16 @@ class DomainService {
           domainVerified: false,
           resendDomainId: resendDomain.id,
           cloudflareDnsRecordIds: dnsResult.recordIds,
+          receivingEnabled,
+          receivingVerified: false,
         },
         update: {
           fromEmail: `support@${fullDomain}`,
           domain: fullDomain,
           resendDomainId: resendDomain.id,
           cloudflareDnsRecordIds: dnsResult.recordIds,
+          receivingEnabled,
+          receivingVerified: false,
         },
       });
 
@@ -183,6 +221,8 @@ class DomainService {
         status: 'not_provisioned',
         dnsRecordsCreated: false,
         lastChecked: null,
+        receivingEnabled: false,
+        receivingVerified: false,
       };
     }
 
@@ -199,6 +239,17 @@ class DomainService {
         });
       }
 
+      // Check if receiving is verified (MX record status from Resend)
+      const mxRecord = domainInfo.data?.records?.find((r: any) => r.type === 'MX');
+      const receivingVerified = mxRecord?.status === 'verified';
+
+      if (receivingVerified && !config.receivingVerified) {
+        await this.prisma.tenantEmailConfig.update({
+          where: { tenantId },
+          data: { receivingVerified: true },
+        });
+      }
+
       return {
         tenantId,
         domain: config.domain || '',
@@ -206,6 +257,8 @@ class DomainService {
         status: status as DomainStatus['status'],
         dnsRecordsCreated: ((config.cloudflareDnsRecordIds as string[]) || []).length > 0,
         lastChecked: new Date(),
+        receivingEnabled: config.receivingEnabled,
+        receivingVerified: receivingVerified || config.receivingVerified,
       };
     } catch (error) {
       return {
@@ -215,7 +268,90 @@ class DomainService {
         status: config.domainVerified ? 'verified' : 'pending',
         dnsRecordsCreated: ((config.cloudflareDnsRecordIds as string[]) || []).length > 0,
         lastChecked: config.updatedAt,
+        receivingEnabled: config.receivingEnabled,
+        receivingVerified: config.receivingVerified,
       };
+    }
+  }
+
+  /**
+   * Enable receiving capability for an existing tenant domain
+   */
+  async enableReceiving(
+    tenantId: string
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const config = await this.prisma.tenantEmailConfig.findUnique({
+        where: { tenantId },
+      });
+
+      if (!config?.resendDomainId) {
+        return { success: false, error: 'No domain configured for tenant' };
+      }
+
+      if (config.receivingEnabled) {
+        return { success: true }; // Already enabled
+      }
+
+      console.log(`[DomainService] Enabling receiving for tenant: ${tenantId}`);
+
+      // Enable receiving via Resend PATCH API
+      const updateResponse = await fetch(`https://api.resend.com/domains/${config.resendDomainId}`, {
+        method: 'PATCH',
+        headers: {
+          'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ receiving: 'enabled' }),
+      });
+
+      if (!updateResponse.ok) {
+        const errorText = await updateResponse.text();
+        return { success: false, error: `Failed to enable receiving: ${errorText}` };
+      }
+
+      // Get updated domain info with MX record
+      const domainInfo = await resend.domains.get(config.resendDomainId);
+      const mxRecord = domainInfo.data?.records?.find((r: any) => r.type === 'MX');
+
+      if (mxRecord) {
+        // Add MX record to Cloudflare
+        const subdomain = config.domain?.replace(`.${this.baseDomain}`, '') || '';
+        console.log(`[DomainService] Adding MX record to Cloudflare for ${subdomain}...`);
+
+        const dnsResult = await cloudflareService.addTenantDnsRecords(subdomain, [
+          {
+            record: mxRecord.record,
+            name: mxRecord.name,
+            type: mxRecord.type,
+            value: mxRecord.value,
+            priority: mxRecord.priority,
+          },
+        ]);
+
+        // Update stored DNS record IDs
+        const existingRecordIds = (config.cloudflareDnsRecordIds as string[]) || [];
+        const allRecordIds = [...existingRecordIds, ...dnsResult.recordIds];
+
+        await this.prisma.tenantEmailConfig.update({
+          where: { tenantId },
+          data: {
+            receivingEnabled: true,
+            cloudflareDnsRecordIds: allRecordIds,
+          },
+        });
+      } else {
+        // No MX record yet, just mark as enabled
+        await this.prisma.tenantEmailConfig.update({
+          where: { tenantId },
+          data: { receivingEnabled: true },
+        });
+      }
+
+      return { success: true };
+    } catch (error: any) {
+      console.error(`[DomainService] Enable receiving error:`, error);
+      return { success: false, error: error.message };
     }
   }
 

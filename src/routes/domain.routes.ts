@@ -97,6 +97,28 @@ router.get('/:tenantId/status', async (req: Request, res: Response) => {
 });
 
 /**
+ * POST /api/domains/:tenantId/enable-receiving
+ * Enable receiving capability for an existing tenant domain
+ */
+router.post('/:tenantId/enable-receiving', async (req: Request, res: Response) => {
+  try {
+    const prisma: PrismaClient = req.app.locals.prisma;
+    const domainService = createDomainService(prisma);
+    const { tenantId } = req.params;
+    const result = await domainService.enableReceiving(tenantId);
+
+    if (result.success) {
+      res.json(result);
+    } else {
+      res.status(500).json(result);
+    }
+  } catch (error: any) {
+    console.error('Enable receiving error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
  * DELETE /api/domains/:tenantId
  * Remove a tenant's email domain
  */

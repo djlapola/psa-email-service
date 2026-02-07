@@ -19,8 +19,8 @@ const authenticate = (req: Request, res: Response, next: NextFunction) => {
 
 // Apply auth to all routes except webhooks
 router.use((req, res, next) => {
-  // Skip auth for Resend webhooks
-  if (req.path === '/webhooks/resend') {
+  // Skip auth for Resend webhooks and inbound email webhooks
+  if (req.path === '/webhooks/resend' || req.path.startsWith('/inbound')) {
     return next();
   }
   authenticate(req, res, next);
@@ -28,23 +28,51 @@ router.use((req, res, next) => {
 
 /**
  * POST /api/send
- * Queue an email for sending
+ * Queue an email for sending (template-based) or send directly (raw HTML)
  */
 router.post('/send', async (req: Request, res: Response) => {
   try {
     const prisma: PrismaClient = req.app.locals.prisma;
     const templateService = new TemplateService(prisma);
-    const { to, template, data, tenantId, from, replyTo } = req.body;
+    const { to, template, data, tenantId, from, replyTo, html, text, subject, headers, cc, bcc, tags, metadata } = req.body;
 
-    // Validation
     if (!to) {
       return res.status(400).json({ error: 'Missing required field: to' });
     }
-    if (!template) {
-      return res.status(400).json({ error: 'Missing required field: template' });
+
+    // Path 1: Raw HTML send (used by sendEmailWithHeaders for threading)
+    if (html && subject) {
+      const { ResendService } = require('../services/resend.service');
+      const resendService = new ResendService(prisma);
+
+      const result = await resendService.sendEmail({
+        to,
+        subject,
+        html,
+        text: text || '',
+        from,
+        replyTo,
+        tenantId,
+        tags: tags ? Object.entries(tags).map(([name, value]) => ({ name, value: String(value) })) : undefined,
+        headers,
+      });
+
+      if (!result.success) {
+        return res.status(500).json({ error: result.error });
+      }
+
+      return res.status(202).json({
+        success: true,
+        message: 'Email sent',
+        emailId: result.resendId,
+      });
     }
 
-    // Check template exists (tenant-specific or system default)
+    // Path 2: Template-based send (existing flow)
+    if (!template) {
+      return res.status(400).json({ error: 'Missing required field: template (or provide html + subject for raw send)' });
+    }
+
     const templateObj = await templateService.getTemplate(template, tenantId);
     if (!templateObj) {
       const allTemplates = await templateService.listSystemTemplates();

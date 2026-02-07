@@ -57,6 +57,8 @@ model TenantEmailConfig {
   domainVerified         Boolean  @default(false)
   resendDomainId         String?  // Resend's domain ID
   cloudflareDnsRecordIds Json?    // Array of Cloudflare record IDs for cleanup
+  receivingEnabled       Boolean  @default(false)  // Whether inbound email is enabled
+  receivingVerified      Boolean  @default(false)  // Whether MX record is verified
   createdAt              DateTime @default(now())
   updatedAt              DateTime @updatedAt
 
@@ -82,4 +84,16 @@ model EmailTemplate {
   @@index([tenantId])
   @@index([name])
   @@index([isSystem])
+}
+
+model EmailMessageId {
+  id        String   @id @default(uuid())
+  tenantId  String
+  ticketId  String
+  commentId String?  // null if this is the original ticket creation email
+  messageId String   // The Message-ID header value from the email
+  createdAt DateTime @default(now())
+
+  @@index([messageId])
+  @@index([tenantId, ticketId])
 }
