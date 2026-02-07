@@ -1,7 +1,7 @@
-import { Resend } from 'resend';
+import sgMail from '@sendgrid/mail';
 import { PrismaClient } from '@prisma/client';
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+sgMail.setApiKey(process.env.SENDGRID_API_KEY || '');
 
 export interface SendEmailOptions {
   to: string | string[];
@@ -17,11 +17,11 @@ export interface SendEmailOptions {
 
 export interface SendEmailResult {
   success: boolean;
-  resendId?: string;
+  messageId?: string;
   error?: string;
 }
 
-export class ResendService {
+export class SendGridService {
   private prisma: PrismaClient;
 
   constructor(prisma: PrismaClient) {
@@ -83,67 +83,34 @@ export class ResendService {
     const replyTo = options.replyTo || tenantConfig.replyTo;
 
     try {
-      const result = await resend.emails.send({
+      const msg: sgMail.MailDataRequired = {
         from,
         to: Array.isArray(options.to) ? options.to : [options.to],
         subject: options.subject,
         html: options.html,
-        text: options.text,
-        reply_to: replyTo,
-        tags: options.tags,
+        text: options.text || '',
+        replyTo: replyTo,
         headers: options.headers,
-      });
+      };
 
-      if (result.error) {
-        return {
-          success: false,
-          error: result.error.message,
-        };
+      if (options.tags && options.tags.length > 0) {
+        msg.categories = options.tags.map(t => `${t.name}:${t.value}`);
       }
+
+      const [response] = await sgMail.send(msg);
 
       return {
         success: true,
-        resendId: result.data?.id,
+        messageId: response.headers['x-message-id'] as string,
       };
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      console.error('Resend API error:', errorMessage);
-      return {
-        success: false,
-        error: errorMessage,
-      };
-    }
-  }
-
-  /**
-   * Verify Resend webhook signature
-   */
-  verifyWebhookSignature(payload: Buffer, signature: string): boolean {
-    const webhookSecret = process.env.RESEND_WEBHOOK_SECRET;
-
-    if (!webhookSecret) {
-      console.warn('RESEND_WEBHOOK_SECRET not configured, skipping signature verification');
-      return true; // Allow in development
-    }
-
-    try {
-      // Resend uses svix for webhooks
-      // For now, we'll do basic validation
-      // In production, use the svix library for proper verification
-      const crypto = require('crypto');
-      const expectedSignature = crypto
-        .createHmac('sha256', webhookSecret)
-        .update(payload)
-        .digest('hex');
-
-      return signature === expectedSignature || signature.includes(expectedSignature);
-    } catch (error) {
-      console.error('Webhook signature verification failed:', error);
-      return false;
+    } catch (error: any) {
+      const errorMessage = error?.response?.body?.errors?.[0]?.message || error?.message || 'Unknown error';
+      console.error('SendGrid API error:', errorMessage);
+      return { success: false, error: errorMessage };
     }
   }
 }
 
-export function createResendService(prisma: PrismaClient): ResendService {
-  return new ResendService(prisma);
+export function createSendGridService(prisma: PrismaClient): SendGridService {
+  return new SendGridService(prisma);
 }

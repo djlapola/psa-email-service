@@ -2,8 +2,10 @@ import { Router, Request, Response } from 'express';
 import { PrismaClient } from '@prisma/client';
 import { createInboundService } from '../services/inbound.service';
 import crypto from 'crypto';
+import multer from 'multer';
 
 const router = Router();
+const upload = multer();
 
 /**
  * Verify Resend webhook signature using Svix format
@@ -79,8 +81,122 @@ function verifyWebhookSignature(
 }
 
 /**
+ * POST /api/inbound/sendgrid
+ * Handle incoming email events from SendGrid Inbound Parse
+ *
+ * SendGrid sends multipart/form-data with these fields:
+ * - from: sender email
+ * - to: recipient email(s)
+ * - cc: CC recipients
+ * - subject: email subject
+ * - text: plain text body
+ * - html: HTML body
+ * - envelope: JSON string with {"to":["email1","email2"],"from":"sender"}
+ * - headers: raw email headers
+ * - attachments: number of attachments
+ * - attachment1, attachment2, etc: attachment files
+ */
+router.post('/sendgrid', upload.any(), async (req: Request, res: Response) => {
+  try {
+    const prisma: PrismaClient = req.app.locals.prisma;
+    const inboundService = createInboundService(prisma);
+
+    const body = req.body;
+
+    console.log('[InboundRoutes:SendGrid] Received inbound email');
+    console.log('[InboundRoutes:SendGrid] Fields:', Object.keys(body));
+
+    // Parse envelope to get all recipients
+    let envelope: { to?: string[]; from?: string } = {};
+    try {
+      envelope = JSON.parse(body.envelope || '{}');
+    } catch (e) {
+      console.warn('[InboundRoutes:SendGrid] Could not parse envelope:', body.envelope);
+    }
+
+    console.log('[InboundRoutes:SendGrid] From:', body.from);
+    console.log('[InboundRoutes:SendGrid] To:', body.to);
+    console.log('[InboundRoutes:SendGrid] CC:', body.cc);
+    console.log('[InboundRoutes:SendGrid] Envelope:', JSON.stringify(envelope));
+    console.log('[InboundRoutes:SendGrid] Subject:', body.subject);
+
+    // Parse headers if present
+    const headers = parseEmailHeaders(body.headers || '');
+
+    // Build email object matching InboundEmail interface
+    const email = {
+      from: body.from || envelope.from || '',
+      to: body.to || (envelope.to ? envelope.to.join(', ') : ''),
+      cc: body.cc || '',
+      subject: body.subject || '',
+      text: body.text || '',
+      html: body.html || '',
+      headers: headers,
+      attachments: [] as Array<{ filename: string; content: string; contentType: string }>,
+      envelope: envelope,
+    };
+
+    console.log(`[InboundRoutes:SendGrid] Processing email from: ${email.from} to: ${email.to} subject: ${email.subject}`);
+
+    // Process the inbound email
+    const result = await inboundService.processInboundEmail(email);
+
+    if (result.success) {
+      console.log(`[InboundRoutes:SendGrid] Successfully processed email -> ticket: ${result.ticketId} (new: ${result.isNew})`);
+    } else {
+      console.error(`[InboundRoutes:SendGrid] Failed to process email: ${result.error}`);
+    }
+
+    // Always return 200 to SendGrid to acknowledge receipt
+    res.status(200).send('OK');
+  } catch (error: any) {
+    console.error('[InboundRoutes:SendGrid] Webhook processing error:', error);
+    // Still return 200 to prevent retries
+    res.status(200).send('OK');
+  }
+});
+
+/**
+ * Parse raw email headers string into key-value object
+ */
+function parseEmailHeaders(headersString: string): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (!headersString) return headers;
+
+  // Headers are separated by newlines, with continuations starting with whitespace
+  const lines = headersString.split(/\r?\n/);
+  let currentKey = '';
+  let currentValue = '';
+
+  for (const line of lines) {
+    if (line.startsWith(' ') || line.startsWith('\t')) {
+      // Continuation of previous header
+      currentValue += ' ' + line.trim();
+    } else {
+      // Save previous header if exists
+      if (currentKey) {
+        headers[currentKey.toLowerCase()] = currentValue;
+      }
+      // Parse new header
+      const colonIndex = line.indexOf(':');
+      if (colonIndex > 0) {
+        currentKey = line.substring(0, colonIndex).trim();
+        currentValue = line.substring(colonIndex + 1).trim();
+      }
+    }
+  }
+
+  // Save last header
+  if (currentKey) {
+    headers[currentKey.toLowerCase()] = currentValue;
+  }
+
+  return headers;
+}
+
+/**
  * POST /api/inbound/webhook
- * Handle incoming email events from Resend
+ * Handle incoming email events from Resend (legacy)
  *
  * Resend sends email.received events when emails are received on domains
  * with receiving enabled.
@@ -256,7 +372,7 @@ router.get('/health', async (req: Request, res: Response) => {
   res.json({
     status: 'ok',
     service: 'inbound-email',
-    receivingEnabled: !!process.env.RESEND_INBOUND_WEBHOOK_SECRET,
+    provider: 'sendgrid',
   });
 });
 

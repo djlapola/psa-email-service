@@ -1,5 +1,5 @@
 import { PrismaClient } from '@prisma/client';
-import { ResendService } from './resend.service';
+import { SendGridService } from './sendgrid.service';
 import { WebhookService } from './webhook.service';
 import { TemplateService } from './template.service';
 
@@ -19,7 +19,7 @@ const PROCESS_INTERVAL = 1000; // Check queue every second
 
 export class QueueService {
   private prisma: PrismaClient;
-  private resendService: ResendService;
+  private sendgridService: SendGridService;
   private webhookService: WebhookService;
   private templateService: TemplateService;
   private queue: QueuedEmail[] = [];
@@ -28,7 +28,7 @@ export class QueueService {
 
   constructor(prisma: PrismaClient) {
     this.prisma = prisma;
-    this.resendService = new ResendService(prisma);
+    this.sendgridService = new SendGridService(prisma);
     this.webhookService = new WebhookService(prisma);
     this.templateService = new TemplateService(prisma);
   }
@@ -145,7 +145,7 @@ export class QueueService {
       data: { status: 'sending', attempts: { increment: 1 } },
     });
 
-    const result = await this.resendService.sendEmail({
+    const result = await this.sendgridService.sendEmail({
       to: email.to,
       subject: rendered.subject,
       html: rendered.html,
@@ -161,11 +161,11 @@ export class QueueService {
         where: { id: email.id },
         data: {
           status: 'sent',
-          resendId: result.resendId,
+          resendId: result.messageId,
           sentAt: new Date(),
         },
       });
-      console.log(`Email sent: ${email.id} -> ${email.to} (resendId: ${result.resendId})`);
+      console.log(`Email sent: ${email.id} -> ${email.to} (messageId: ${result.messageId})`);
     } else {
       const log = await this.prisma.emailLog.findUnique({ where: { id: email.id } });
       const attempts = log?.attempts || 1;

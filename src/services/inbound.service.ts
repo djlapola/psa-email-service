@@ -16,6 +16,10 @@ interface InboundEmail {
     content: string; // base64 encoded
     contentType: string;
   }>;
+  envelope?: {
+    to?: string[];
+    from?: string;
+  };
 }
 
 interface TicketMatch {
@@ -252,31 +256,48 @@ class InboundService {
   }
 
   /**
-   * Extract additional recipients (TO excluding support@, plus all CC) for watcher handling
+   * Extract just the email address from a "From" field
+   * Handles formats like: "Name <email@example.com>" or just "email@example.com"
    */
-  private getAdditionalRecipients(to: string, cc: string | undefined, subdomain: string): string {
-    console.log(`[InboundService] getAdditionalRecipients - to: "${to}", cc: "${cc}", subdomain: "${subdomain}"`);
+  private extractEmailAddress(from: string): string {
+    const match = from.match(/<([^>]+)>/);
+    if (match) {
+      return match[1].toLowerCase();
+    }
+    // If no angle brackets, assume it's just the email
+    return from.trim().toLowerCase();
+  }
+
+  /**
+   * Extract additional recipients (TO excluding support@, plus all CC) for watcher handling
+   * Always parses the TO header since envelope.to only contains the address SendGrid received for
+   */
+  private getAdditionalRecipients(email: InboundEmail, subdomain: string): string {
+    console.log(`[InboundService] getAdditionalRecipients - to: "${email.to}", cc: "${email.cc}", envelope: ${JSON.stringify(email.envelope)}, subdomain: "${subdomain}"`);
     const supportEmail = `support@${subdomain}.${this.baseDomain}`.toLowerCase();
     const recipients: string[] = [];
 
-    // Parse TO addresses, exclude the support@ address
-    if (to) {
-      const toAddresses = to.split(',').map(e => e.trim()).filter(Boolean);
+    // Always parse TO header - it contains ALL recipients
+    // (envelope.to only contains the address SendGrid actually received for)
+    if (email.to) {
+      const toAddresses = email.to.split(',').map(e => e.trim()).filter(Boolean);
       for (const addr of toAddresses) {
-        const emailMatch = addr.match(/<([^>]+)>/) || [null, addr];
-        const email = (emailMatch[1] || addr).trim().toLowerCase();
-        if (email && email !== supportEmail && !recipients.includes(addr)) {
-          recipients.push(addr);
+        const emailMatch = addr.match(/<([^>]+)>/);
+        const emailAddr = (emailMatch ? emailMatch[1] : addr).trim().toLowerCase();
+        if (emailAddr && emailAddr !== supportEmail && !recipients.includes(emailAddr)) {
+          recipients.push(emailAddr);
         }
       }
     }
 
     // Add all CC addresses
-    if (cc) {
-      const ccAddresses = cc.split(',').map(e => e.trim()).filter(Boolean);
+    if (email.cc) {
+      const ccAddresses = email.cc.split(',').map(e => e.trim()).filter(Boolean);
       for (const addr of ccAddresses) {
-        if (!recipients.includes(addr)) {
-          recipients.push(addr);
+        const emailMatch = addr.match(/<([^>]+)>/);
+        const emailAddr = (emailMatch ? emailMatch[1] : addr).trim().toLowerCase();
+        if (emailAddr && !recipients.includes(emailAddr)) {
+          recipients.push(emailAddr);
         }
       }
     }
@@ -340,10 +361,10 @@ class InboundService {
         },
         body: JSON.stringify({
           tenantSubdomain: subdomain,
-          fromEmail: email.from,
-          fromName: email.from.replace(/<.*>/, "").trim() || email.from,
+          fromEmail: this.extractEmailAddress(email.from),
+          fromName: email.from.replace(/<.*>/, "").trim().replace(/^["']|["']$/g, '') || this.extractEmailAddress(email.from),
           toEmail: email.to,
-          additionalRecipients: this.getAdditionalRecipients(email.to, email.cc, subdomain),
+          additionalRecipients: this.getAdditionalRecipients(email, subdomain),
           subject: email.subject || "No Subject",
           bodyText: this.stripQuotedText(email.text || ""),
           bodyHtml: this.stripQuotedText(email.html || ""),
@@ -395,9 +416,9 @@ class InboundService {
         body: JSON.stringify({
           tenantId,
           tenantSubdomain: subdomain,
-          fromEmail: email.from,
-          fromName: email.from.replace(/<.*>/, "").trim() || email.from,
-          additionalRecipients: this.getAdditionalRecipients(email.to, email.cc, subdomain),
+          fromEmail: this.extractEmailAddress(email.from),
+          fromName: email.from.replace(/<.*>/, "").trim().replace(/^["']|["']$/g, '') || this.extractEmailAddress(email.from),
+          additionalRecipients: this.getAdditionalRecipients(email, subdomain),
           bodyText: this.stripQuotedText(email.text || ""),
           bodyHtml: this.stripQuotedText(email.html || ""),
           messageId: email.headers?.["message-id"] || email.headers?.["Message-ID"] || "",

@@ -1,13 +1,13 @@
-import { Resend } from 'resend';
+import sgClient from '@sendgrid/client';
 import { PrismaClient } from '@prisma/client';
 import { cloudflareService } from './cloudflare.service';
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+sgClient.setApiKey(process.env.SENDGRID_API_KEY || '');
 
 interface DomainProvisionResult {
   success: boolean;
   domain?: string;
-  resendDomainId?: string;
+  sendgridDomainId?: string;
   status?: string;
   error?: string;
 }
@@ -15,7 +15,7 @@ interface DomainProvisionResult {
 interface DomainStatus {
   tenantId: string;
   domain: string;
-  resendDomainId: string | null;
+  sendgridDomainId: string | null;
   status: 'not_started' | 'pending' | 'verified' | 'failed' | 'not_provisioned';
   dnsRecordsCreated: boolean;
   lastChecked: Date | null;
@@ -26,18 +26,19 @@ interface DomainStatus {
 class DomainService {
   private baseDomain: string;
   private prisma: PrismaClient;
+  private inboundWebhookUrl: string;
 
   constructor(prisma: PrismaClient) {
     this.baseDomain = process.env.BASE_DOMAIN || 'skyrack.com';
     this.prisma = prisma;
+    this.inboundWebhookUrl = process.env.SENDGRID_INBOUND_WEBHOOK_URL || '';
   }
 
   /**
    * Provision a new email domain for a tenant
-   * 1. Create domain in Resend
+   * 1. Create domain authentication in SendGrid
    * 2. Add DNS records to Cloudflare
-   * 3. Trigger verification
-   * 4. Store config in database
+   * 3. Store config in database
    */
   async provisionTenantDomain(
     tenantId: string,
@@ -45,125 +46,115 @@ class DomainService {
   ): Promise<DomainProvisionResult> {
     const fullDomain = `${subdomain}.${this.baseDomain}`;
 
-    console.log(`[DomainService] Provisioning domain: ${fullDomain} for tenant: ${tenantId}`);
-
     try {
-      // Step 1: Create domain in Resend with sending AND receiving enabled
-      console.log(`[DomainService] Creating domain in Resend with sending and receiving...`);
-      const resendResult = await resend.domains.create({
-        name: fullDomain,
-        region: 'us-east-1',
-      } as any); // Note: capabilities are set via separate API call after creation
+      console.log(`[DomainService] Provisioning domain ${fullDomain} for tenant ${tenantId}`);
 
-      if (resendResult.error) {
-        console.error(`[DomainService] Resend error:`, resendResult.error);
-        return {
-          success: false,
-          error: `Resend error: ${resendResult.error.message}`,
-        };
-      }
+      // Step 1: Create domain authentication in SendGrid
+      const [response, body] = await sgClient.request({
+        method: 'POST',
+        url: '/v3/whitelabel/domains',
+        body: {
+          domain: fullDomain,      // e.g., 'deskside.skyrack.com' - authenticate the full tenant domain
+          subdomain: 'em',         // SendGrid creates DKIM records under em.deskside.skyrack.com
+          automatic_security: true,
+          default: false,
+        },
+      });
 
-      const resendDomain = resendResult.data!;
-      console.log(`[DomainService] Resend domain created: ${resendDomain.id}`);
+      const sendgridDomain = body as any;
+      const sendgridDomainId = String(sendgridDomain.id);
 
-      // Step 1b: Enable receiving capability via PATCH
-      console.log(`[DomainService] Enabling receiving capability...`);
-      let receivingEnabled = false;
-      let domainRecords = resendDomain.records;
+      console.log(`[DomainService] SendGrid domain created with ID: ${sendgridDomainId}`);
 
-      try {
-        const updateResponse = await fetch(`https://api.resend.com/domains/${resendDomain.id}`, {
-          method: 'PATCH',
-          headers: {
-            'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ receiving: 'enabled' }),
-        });
+      // Step 2: Extract DNS records from SendGrid response and create in Cloudflare
+      // SendGrid returns a dns object with keys like mail_cname, dkim1, dkim2
+      const dnsRecords = sendgridDomain.dns || {};
+      const recordIds: string[] = [];
+      const errors: string[] = [];
 
-        if (updateResponse.ok) {
-          receivingEnabled = true;
-          console.log(`[DomainService] Receiving enabled for domain`);
+      for (const key of Object.keys(dnsRecords)) {
+        const record = dnsRecords[key];
+        if (record.host && record.data) {
+          const result = await cloudflareService.createDnsRecord({
+            type: (record.type || 'cname').toUpperCase() as 'MX' | 'TXT' | 'CNAME',
+            name: record.host,
+            content: record.data,
+          });
 
-          // Fetch updated domain info to get MX records
-          const domainInfo = await resend.domains.get(resendDomain.id);
-          if (domainInfo.data?.records) {
-            domainRecords = domainInfo.data.records;
+          if (result.success && result.id) {
+            recordIds.push(result.id);
+          } else {
+            errors.push(`Failed to create ${record.type} record for ${record.host}: ${result.error}`);
           }
-        } else {
-          const errorText = await updateResponse.text();
-          console.warn(`[DomainService] Failed to enable receiving: ${errorText}`);
         }
-      } catch (err) {
-        console.warn(`[DomainService] Error enabling receiving:`, err);
       }
 
-      // Step 2: Add DNS records to Cloudflare (including MX if receiving enabled)
-      console.log(`[DomainService] Adding DNS records to Cloudflare...`);
-      const dnsResult = await cloudflareService.addTenantDnsRecords(
-        subdomain,
-        domainRecords.map((r: any) => ({
-          record: r.record,
-          name: r.name,
-          type: r.type,
-          value: r.value,
-          priority: r.priority,
-        }))
-      );
+      // Step 3: Add MX record for inbound email receiving
+      const mxResult = await cloudflareService.createDnsRecord({
+        type: 'MX',
+        name: fullDomain,
+        content: 'mx.sendgrid.net',
+        priority: 10,
+      });
 
-      if (!dnsResult.success) {
-        console.error(`[DomainService] DNS errors:`, dnsResult.errors);
-        // Don't fail completely - domain is created, DNS can be retried
+      if (mxResult.success && mxResult.id) {
+        recordIds.push(mxResult.id);
+      } else {
+        errors.push(`Failed to create MX record: ${mxResult.error}`);
       }
 
-      // Step 3: Store in database
-      console.log(`[DomainService] Storing config in database...`);
+      if (errors.length > 0) {
+        console.error(`[DomainService] DNS record errors:`, errors);
+      }
+
+      console.log(`[DomainService] Created ${recordIds.length} DNS records in Cloudflare`);
+
+      // Step 4: Store in database (reusing resendDomainId field for SendGrid ID)
       await this.prisma.tenantEmailConfig.upsert({
         where: { tenantId },
         create: {
           tenantId,
+          domain: fullDomain,
           fromEmail: `support@${fullDomain}`,
           fromName: `${subdomain} Support`,
-          domain: fullDomain,
+          resendDomainId: sendgridDomainId,
+          cloudflareDnsRecordIds: recordIds,
           domainVerified: false,
-          resendDomainId: resendDomain.id,
-          cloudflareDnsRecordIds: dnsResult.recordIds,
-          receivingEnabled,
+          receivingEnabled: false,
           receivingVerified: false,
         },
         update: {
-          fromEmail: `support@${fullDomain}`,
           domain: fullDomain,
-          resendDomainId: resendDomain.id,
-          cloudflareDnsRecordIds: dnsResult.recordIds,
-          receivingEnabled,
-          receivingVerified: false,
+          fromEmail: `support@${fullDomain}`,
+          resendDomainId: sendgridDomainId,
+          cloudflareDnsRecordIds: recordIds,
+          domainVerified: false,
         },
       });
 
-      // Step 4: Trigger verification (with delay to allow DNS propagation)
-      console.log(`[DomainService] Scheduling verification...`);
+      // Step 5: Schedule verification after DNS propagation
+      console.log(`[DomainService] Scheduling verification in 30s...`);
       setTimeout(async () => {
         await this.verifyDomain(tenantId);
-      }, 30000); // Wait 30 seconds for DNS propagation
+      }, 30000);
 
       return {
         success: true,
         domain: fullDomain,
-        resendDomainId: resendDomain.id,
-        status: resendDomain.status,
+        sendgridDomainId,
+        status: 'pending',
       };
     } catch (error: any) {
-      console.error(`[DomainService] Provision error:`, error);
+      console.error(`[DomainService] Provision error:`, error?.response?.body || error);
       return {
         success: false,
-        error: error.message,
+        error: error?.response?.body?.errors?.[0]?.message || error.message,
       };
     }
   }
 
   /**
-   * Trigger domain verification in Resend
+   * Trigger domain verification in SendGrid
    */
   async verifyDomain(
     tenantId: string
@@ -177,31 +168,36 @@ class DomainService {
         return { success: false, error: 'No domain configured for tenant' };
       }
 
-      console.log(`[DomainService] Verifying domain: ${config.resendDomainId}`);
+      console.log(`[DomainService] Validating domain: ${config.resendDomainId}`);
 
-      const result = await resend.domains.verify(config.resendDomainId);
+      const [response, body] = await sgClient.request({
+        method: 'POST',
+        url: `/v3/whitelabel/domains/${config.resendDomainId}/validate`,
+      });
 
-      if (result.error) {
-        return { success: false, error: result.error.message };
-      }
+      const validation = body as any;
+      const isValid = validation.valid === true;
 
-      // Check status
-      const domainInfo = await resend.domains.get(config.resendDomainId);
-      const status = domainInfo.data?.status;
-
-      // Update database
       await this.prisma.tenantEmailConfig.update({
         where: { tenantId },
         data: {
-          domainVerified: status === 'verified',
+          domainVerified: isValid,
           updatedAt: new Date(),
         },
       });
 
-      return { success: true, status };
+      console.log(`[DomainService] Domain validation result: ${isValid ? 'verified' : 'pending'}`);
+
+      return {
+        success: true,
+        status: isValid ? 'verified' : 'pending',
+      };
     } catch (error: any) {
-      console.error(`[DomainService] Verify error:`, error);
-      return { success: false, error: error.message };
+      console.error(`[DomainService] Verify error:`, error?.response?.body || error);
+      return {
+        success: false,
+        error: error?.response?.body?.errors?.[0]?.message || error.message,
+      };
     }
   }
 
@@ -217,7 +213,7 @@ class DomainService {
       return {
         tenantId,
         domain: '',
-        resendDomainId: null,
+        sendgridDomainId: null,
         status: 'not_provisioned',
         dnsRecordsCreated: false,
         lastChecked: null,
@@ -226,45 +222,40 @@ class DomainService {
       };
     }
 
-    // Get current status from Resend
+    // Check current status from SendGrid
     try {
-      const domainInfo = await resend.domains.get(config.resendDomainId);
-      const status = domainInfo.data?.status || 'pending';
+      const [response, body] = await sgClient.request({
+        method: 'GET',
+        url: `/v3/whitelabel/domains/${config.resendDomainId}`,
+      });
+
+      const domainInfo = body as any;
+      const isValid = domainInfo.valid === true;
 
       // Update database if status changed
-      if (status === 'verified' && !config.domainVerified) {
+      if (isValid && !config.domainVerified) {
         await this.prisma.tenantEmailConfig.update({
           where: { tenantId },
           data: { domainVerified: true },
         });
       }
 
-      // Check if receiving is verified (MX record status from Resend)
-      const mxRecord = domainInfo.data?.records?.find((r: any) => r.type === 'MX');
-      const receivingVerified = mxRecord?.status === 'verified';
-
-      if (receivingVerified && !config.receivingVerified) {
-        await this.prisma.tenantEmailConfig.update({
-          where: { tenantId },
-          data: { receivingVerified: true },
-        });
-      }
-
       return {
         tenantId,
         domain: config.domain || '',
-        resendDomainId: config.resendDomainId,
-        status: status as DomainStatus['status'],
+        sendgridDomainId: config.resendDomainId,
+        status: isValid ? 'verified' : 'pending',
         dnsRecordsCreated: ((config.cloudflareDnsRecordIds as string[]) || []).length > 0,
         lastChecked: new Date(),
         receivingEnabled: config.receivingEnabled,
-        receivingVerified: receivingVerified || config.receivingVerified,
+        receivingVerified: config.receivingVerified,
       };
     } catch (error) {
+      // Fall back to database status
       return {
         tenantId,
         domain: config.domain || '',
-        resendDomainId: config.resendDomainId,
+        sendgridDomainId: config.resendDomainId,
         status: config.domainVerified ? 'verified' : 'pending',
         dnsRecordsCreated: ((config.cloudflareDnsRecordIds as string[]) || []).length > 0,
         lastChecked: config.updatedAt,
@@ -276,6 +267,7 @@ class DomainService {
 
   /**
    * Enable receiving capability for an existing tenant domain
+   * Sets up SendGrid Inbound Parse webhook for this domain
    */
   async enableReceiving(
     tenantId: string
@@ -285,7 +277,7 @@ class DomainService {
         where: { tenantId },
       });
 
-      if (!config?.resendDomainId) {
+      if (!config || !config.domain) {
         return { success: false, error: 'No domain configured for tenant' };
       }
 
@@ -293,65 +285,40 @@ class DomainService {
         return { success: true }; // Already enabled
       }
 
-      console.log(`[DomainService] Enabling receiving for tenant: ${tenantId}`);
+      if (!this.inboundWebhookUrl) {
+        return { success: false, error: 'SENDGRID_INBOUND_WEBHOOK_URL not configured' };
+      }
 
-      // Enable receiving via Resend PATCH API
-      const updateResponse = await fetch(`https://api.resend.com/domains/${config.resendDomainId}`, {
-        method: 'PATCH',
-        headers: {
-          'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
-          'Content-Type': 'application/json',
+      console.log(`[DomainService] Setting up Inbound Parse for ${config.domain}`);
+
+      const [response, body] = await sgClient.request({
+        method: 'POST',
+        url: '/v3/user/webhooks/parse/settings',
+        body: {
+          hostname: config.domain,
+          url: this.inboundWebhookUrl,
+          spam_check: true,
+          send_raw: false,
         },
-        body: JSON.stringify({ receiving: 'enabled' }),
       });
 
-      if (!updateResponse.ok) {
-        const errorText = await updateResponse.text();
-        return { success: false, error: `Failed to enable receiving: ${errorText}` };
-      }
+      await this.prisma.tenantEmailConfig.update({
+        where: { tenantId },
+        data: {
+          receivingEnabled: true,
+          receivingVerified: true,
+        },
+      });
 
-      // Get updated domain info with MX record
-      const domainInfo = await resend.domains.get(config.resendDomainId);
-      const mxRecord = domainInfo.data?.records?.find((r: any) => r.type === 'MX');
-
-      if (mxRecord) {
-        // Add MX record to Cloudflare
-        const subdomain = config.domain?.replace(`.${this.baseDomain}`, '') || '';
-        console.log(`[DomainService] Adding MX record to Cloudflare for ${subdomain}...`);
-
-        const dnsResult = await cloudflareService.addTenantDnsRecords(subdomain, [
-          {
-            record: mxRecord.record,
-            name: mxRecord.name,
-            type: mxRecord.type,
-            value: mxRecord.value,
-            priority: mxRecord.priority,
-          },
-        ]);
-
-        // Update stored DNS record IDs
-        const existingRecordIds = (config.cloudflareDnsRecordIds as string[]) || [];
-        const allRecordIds = [...existingRecordIds, ...dnsResult.recordIds];
-
-        await this.prisma.tenantEmailConfig.update({
-          where: { tenantId },
-          data: {
-            receivingEnabled: true,
-            cloudflareDnsRecordIds: allRecordIds,
-          },
-        });
-      } else {
-        // No MX record yet, just mark as enabled
-        await this.prisma.tenantEmailConfig.update({
-          where: { tenantId },
-          data: { receivingEnabled: true },
-        });
-      }
+      console.log(`[DomainService] Inbound Parse enabled for ${config.domain}`);
 
       return { success: true };
     } catch (error: any) {
-      console.error(`[DomainService] Enable receiving error:`, error);
-      return { success: false, error: error.message };
+      console.error(`[DomainService] Enable receiving error:`, error?.response?.body || error);
+      return {
+        success: false,
+        error: error?.response?.body?.errors?.[0]?.message || error.message,
+      };
     }
   }
 
@@ -370,14 +337,33 @@ class DomainService {
         return { success: true }; // Nothing to remove
       }
 
+      // Remove Inbound Parse setting from SendGrid
+      if (config.domain && config.receivingEnabled) {
+        try {
+          await sgClient.request({
+            method: 'DELETE',
+            url: `/v3/user/webhooks/parse/settings/${config.domain}`,
+          });
+        } catch (e: any) {
+          console.warn(`[DomainService] Could not remove inbound parse: ${e.message}`);
+        }
+      }
+
+      // Remove domain authentication from SendGrid
+      if (config.resendDomainId) {
+        try {
+          await sgClient.request({
+            method: 'DELETE',
+            url: `/v3/whitelabel/domains/${config.resendDomainId}`,
+          });
+        } catch (e: any) {
+          console.warn(`[DomainService] Could not remove SendGrid domain: ${e.message}`);
+        }
+      }
+
       // Remove DNS records from Cloudflare
       if (config.cloudflareDnsRecordIds && Array.isArray(config.cloudflareDnsRecordIds)) {
         await cloudflareService.removeTenantDnsRecords(config.cloudflareDnsRecordIds as string[]);
-      }
-
-      // Delete domain from Resend
-      if (config.resendDomainId) {
-        await resend.domains.remove(config.resendDomainId);
       }
 
       // Remove from database

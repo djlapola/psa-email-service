@@ -42,10 +42,10 @@ router.post('/send', async (req: Request, res: Response) => {
 
     // Path 1: Raw HTML send (used by sendEmailWithHeaders for threading)
     if (html && subject) {
-      const { ResendService } = require('../services/resend.service');
-      const resendService = new ResendService(prisma);
+      const { SendGridService } = require('../services/sendgrid.service');
+      const sendgridService = new SendGridService(prisma);
 
-      const result = await resendService.sendEmail({
+      const result = await sendgridService.sendEmail({
         to,
         subject,
         html,
@@ -64,7 +64,7 @@ router.post('/send', async (req: Request, res: Response) => {
       return res.status(202).json({
         success: true,
         message: 'Email sent',
-        emailId: result.resendId,
+        emailId: result.messageId,
       });
     }
 
