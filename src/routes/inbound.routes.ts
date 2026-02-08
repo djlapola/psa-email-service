@@ -123,6 +123,42 @@ router.post('/sendgrid', upload.any(), async (req: Request, res: Response) => {
     // Parse headers if present
     const headers = parseEmailHeaders(body.headers || '');
 
+    // Extract attachments from multipart files
+    const attachments: Array<{ filename: string; content: string; contentType: string; contentId?: string; size: number }> = [];
+    if (req.files && Array.isArray(req.files)) {
+      for (const file of req.files as Express.Multer.File[]) {
+        // SendGrid attachment fields are named 'attachment1', 'attachment2', etc.
+        if (file.fieldname.startsWith('attachment')) {
+          // Get content-id from attachment-info JSON
+          let contentId: string | undefined;
+
+          const attachmentInfoKey = 'attachment-info';
+          if (body[attachmentInfoKey]) {
+            try {
+              const attachmentInfo = JSON.parse(body[attachmentInfoKey]);
+              const info = attachmentInfo[file.fieldname];
+              if (info && info['content-id']) {
+                contentId = info['content-id'].replace(/[<>]/g, '');
+              }
+            } catch (e) {
+              console.warn('[InboundRoutes:SendGrid] Could not parse attachment-info');
+            }
+          }
+
+          attachments.push({
+            filename: file.originalname || 'attachment',
+            content: file.buffer.toString('base64'),
+            contentType: file.mimetype || 'application/octet-stream',
+            contentId: contentId,
+            size: file.size,
+          });
+
+          console.log(`[InboundRoutes:SendGrid] Attachment: ${file.originalname} (${file.mimetype}, ${file.size} bytes, cid: ${contentId || 'none'})`);
+        }
+      }
+    }
+    console.log(`[InboundRoutes:SendGrid] Total attachments: ${attachments.length}`);
+
     // Build email object matching InboundEmail interface
     const email = {
       from: body.from || envelope.from || '',
@@ -132,7 +168,7 @@ router.post('/sendgrid', upload.any(), async (req: Request, res: Response) => {
       text: body.text || '',
       html: body.html || '',
       headers: headers,
-      attachments: [] as Array<{ filename: string; content: string; contentType: string }>,
+      attachments: attachments,
       envelope: envelope,
     };
 
