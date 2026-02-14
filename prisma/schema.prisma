@@ -14,7 +14,7 @@ model EmailLog {
   subject   String
   template  String
   status    String    @default("queued") // queued, sending, sent, delivered, bounced, complained, failed
-  resendId  String?
+  sendgridMessageId  String?
   tenantId  String?
   metadata  Json?
   error     String?
@@ -27,7 +27,7 @@ model EmailLog {
   @@index([status])
   @@index([template])
   @@index([createdAt])
-  @@index([resendId])
+  @@index([sendgridMessageId])
 }
 
 model WebhookDelivery {
@@ -55,7 +55,7 @@ model TenantEmailConfig {
   replyTo                String?
   domain                 String?  // e.g., acme.skyrack.com
   domainVerified         Boolean  @default(false)
-  resendDomainId         String?  // Resend's domain ID
+  sendgridDomainId       String?  // SendGrid's domain authentication ID
   cloudflareDnsRecordIds Json?    // Array of Cloudflare record IDs for cleanup
   receivingEnabled       Boolean  @default(false)  // Whether inbound email is enabled
   receivingVerified      Boolean  @default(false)  // Whether MX record is verified
@@ -84,6 +84,31 @@ model EmailTemplate {
   @@index([tenantId])
   @@index([name])
   @@index([isSystem])
+}
+
+model TenantEmailDomain {
+  id                String    @id @default(uuid())
+  tenantId          String
+  domain            String    // e.g., "deskside.com"
+  status            String    @default("pending") // "pending", "verified", "failed"
+
+  // SendGrid domain authentication
+  sendgridDomainId  String?   // SendGrid authenticated domain ID
+
+  // DNS records the tenant needs to add
+  dnsRecords        Json?     // Array of { type: "CNAME"|"TXT", host: "...", value: "...", valid: boolean }
+
+  // Verification
+  lastVerifiedAt    DateTime?
+  verifiedAt        DateTime?
+
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@unique([tenantId, domain])
+  @@index([tenantId])
+  @@index([domain])
+  @@map("tenant_email_domains")
 }
 
 model EmailMessageId {

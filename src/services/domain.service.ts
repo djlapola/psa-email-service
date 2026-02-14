@@ -109,7 +109,7 @@ class DomainService {
 
       console.log(`[DomainService] Created ${recordIds.length} DNS records in Cloudflare`);
 
-      // Step 4: Store in database (reusing resendDomainId field for SendGrid ID)
+      // Step 4: Store in database
       await this.prisma.tenantEmailConfig.upsert({
         where: { tenantId },
         create: {
@@ -117,7 +117,7 @@ class DomainService {
           domain: fullDomain,
           fromEmail: `support@${fullDomain}`,
           fromName: `${subdomain} Support`,
-          resendDomainId: sendgridDomainId,
+          sendgridDomainId: sendgridDomainId,
           cloudflareDnsRecordIds: recordIds,
           domainVerified: false,
           receivingEnabled: false,
@@ -126,7 +126,7 @@ class DomainService {
         update: {
           domain: fullDomain,
           fromEmail: `support@${fullDomain}`,
-          resendDomainId: sendgridDomainId,
+          sendgridDomainId: sendgridDomainId,
           cloudflareDnsRecordIds: recordIds,
           domainVerified: false,
         },
@@ -164,15 +164,15 @@ class DomainService {
         where: { tenantId },
       });
 
-      if (!config?.resendDomainId) {
+      if (!config?.sendgridDomainId) {
         return { success: false, error: 'No domain configured for tenant' };
       }
 
-      console.log(`[DomainService] Validating domain: ${config.resendDomainId}`);
+      console.log(`[DomainService] Validating domain: ${config.sendgridDomainId}`);
 
       const [response, body] = await sgClient.request({
         method: 'POST',
-        url: `/v3/whitelabel/domains/${config.resendDomainId}/validate`,
+        url: `/v3/whitelabel/domains/${config.sendgridDomainId}/validate`,
       });
 
       const validation = body as any;
@@ -209,7 +209,7 @@ class DomainService {
       where: { tenantId },
     });
 
-    if (!config || !config.resendDomainId) {
+    if (!config || !config.sendgridDomainId) {
       return {
         tenantId,
         domain: '',
@@ -226,7 +226,7 @@ class DomainService {
     try {
       const [response, body] = await sgClient.request({
         method: 'GET',
-        url: `/v3/whitelabel/domains/${config.resendDomainId}`,
+        url: `/v3/whitelabel/domains/${config.sendgridDomainId}`,
       });
 
       const domainInfo = body as any;
@@ -243,7 +243,7 @@ class DomainService {
       return {
         tenantId,
         domain: config.domain || '',
-        sendgridDomainId: config.resendDomainId,
+        sendgridDomainId: config.sendgridDomainId,
         status: isValid ? 'verified' : 'pending',
         dnsRecordsCreated: ((config.cloudflareDnsRecordIds as string[]) || []).length > 0,
         lastChecked: new Date(),
@@ -255,7 +255,7 @@ class DomainService {
       return {
         tenantId,
         domain: config.domain || '',
-        sendgridDomainId: config.resendDomainId,
+        sendgridDomainId: config.sendgridDomainId,
         status: config.domainVerified ? 'verified' : 'pending',
         dnsRecordsCreated: ((config.cloudflareDnsRecordIds as string[]) || []).length > 0,
         lastChecked: config.updatedAt,
@@ -350,11 +350,11 @@ class DomainService {
       }
 
       // Remove domain authentication from SendGrid
-      if (config.resendDomainId) {
+      if (config.sendgridDomainId) {
         try {
           await sgClient.request({
             method: 'DELETE',
-            url: `/v3/whitelabel/domains/${config.resendDomainId}`,
+            url: `/v3/whitelabel/domains/${config.sendgridDomainId}`,
           });
         } catch (e: any) {
           console.warn(`[DomainService] Could not remove SendGrid domain: ${e.message}`);

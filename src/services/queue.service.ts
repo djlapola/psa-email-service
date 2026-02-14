@@ -1,7 +1,7 @@
 import { PrismaClient } from '@prisma/client';
 import { SendGridService } from './sendgrid.service';
 import { WebhookService } from './webhook.service';
-import { TemplateService } from './template.service';
+import { TemplateService, injectAttachmentIndicator } from './template.service';
 
 export interface QueuedEmail {
   id: string;
@@ -139,6 +139,11 @@ export class QueueService {
       return;
     }
 
+    // Inject attachment indicator if data includes attachmentCount > 0
+    const withAttachments = injectAttachmentIndicator(rendered, email.data);
+    rendered.html = withAttachments.html;
+    rendered.text = withAttachments.text;
+
     // Update status to sending
     await this.prisma.emailLog.update({
       where: { id: email.id },
@@ -161,7 +166,7 @@ export class QueueService {
         where: { id: email.id },
         data: {
           status: 'sent',
-          resendId: result.messageId,
+          sendgridMessageId: result.messageId,
           sentAt: new Date(),
         },
       });

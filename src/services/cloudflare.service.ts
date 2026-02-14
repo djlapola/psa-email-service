@@ -124,7 +124,7 @@ class CloudflareService {
    */
   async addTenantDnsRecords(
     subdomain: string,
-    resendRecords: Array<{
+    dnsRecords: Array<{
       record: string;
       name: string;
       type: string;
@@ -136,12 +136,7 @@ class CloudflareService {
     const recordIds: string[] = [];
     const errors: string[] = [];
 
-    for (const record of resendRecords) {
-      // Resend returns record names relative to the zone root (baseDomain).
-      // For domain "testmsp.skyrack.com", Resend returns names like:
-      //   - "send.testmsp" -> should become "send.testmsp.skyrack.com"
-      //   - "resend._domainkey.testmsp" -> should become "resend._domainkey.testmsp.skyrack.com"
-      // We just need to append the baseDomain, NOT the subdomain (it's already included).
+    for (const record of dnsRecords) {
       const fullName = `${record.name}.${baseDomain}`;
 
       const result = await this.createDnsRecord({

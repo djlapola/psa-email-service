@@ -373,7 +373,7 @@ class InboundService {
           messageId: email.headers?.["message-id"] || email.headers?.["Message-ID"] || "",
           inReplyTo: email.headers?.["in-reply-to"] || email.headers?.["In-Reply-To"] || null,
           references: (email.headers?.["references"] || email.headers?.["References"] || "").split(/\s+/).filter(Boolean),
-          attachments: (email.attachments || []).map(a => ({ filename: a.filename, content: a.content, contentType: a.contentType, contentId: a.contentId, size: a.size || 0 })),
+          attachments: (email.attachments || []).map(a => ({ filename: a.filename, content: a.content, mimeType: a.contentType, contentId: a.contentId, fileSize: a.size || 0 })),
         }),
       });
 
@@ -424,7 +424,7 @@ class InboundService {
           bodyText: this.stripQuotedText(email.text || ""),
           bodyHtml: this.stripQuotedText(email.html || ""),
           messageId: email.headers?.["message-id"] || email.headers?.["Message-ID"] || "",
-          attachments: (email.attachments || []).map(a => ({ filename: a.filename, content: a.content, contentType: a.contentType, contentId: a.contentId, size: a.size || 0 })),
+          attachments: (email.attachments || []).map(a => ({ filename: a.filename, content: a.content, mimeType: a.contentType, contentId: a.contentId, fileSize: a.size || 0 })),
         }),
       });
 

@@ -8,7 +8,7 @@ export interface EmailEvent {
   template?: string;
   reason?: string;
   error?: string;
-  resendId?: string;
+  messageId?: string;
 }
 
 const MAX_WEBHOOK_RETRIES = 3;
@@ -19,83 +19,6 @@ export class WebhookService {
 
   constructor(prisma: PrismaClient) {
     this.prisma = prisma;
-  }
-
-  /**
-   * Handle incoming Resend webhook events
-   */
-  async handleResendWebhook(event: any): Promise<void> {
-    const { type, data } = event;
-
-    console.log(`Received Resend webhook: ${type}`, data);
-
-    // Find the email log by resend ID
-    const emailLog = await this.prisma.emailLog.findFirst({
-      where: { resendId: data.email_id },
-    });
-
-    if (!emailLog) {
-      console.warn(`Email log not found for resend ID: ${data.email_id}`);
-      return;
-    }
-
-    let newStatus: string;
-    let notifyEvent: EmailEvent | null = null;
-
-    switch (type) {
-      case 'email.delivered':
-        newStatus = 'delivered';
-        notifyEvent = {
-          event: 'email.delivered',
-          emailId: emailLog.id,
-          to: emailLog.to,
-          tenantId: emailLog.tenantId || undefined,
-          template: emailLog.template,
-          resendId: data.email_id,
-        };
-        break;
-
-      case 'email.bounced':
-        newStatus = 'bounced';
-        notifyEvent = {
-          event: 'email.bounced',
-          emailId: emailLog.id,
-          to: emailLog.to,
-          tenantId: emailLog.tenantId || undefined,
-          template: emailLog.template,
-          reason: data.bounce?.type || 'Unknown bounce',
-          resendId: data.email_id,
-        };
-        break;
-
-      case 'email.complained':
-        newStatus = 'complained';
-        notifyEvent = {
-          event: 'email.complained',
-          emailId: emailLog.id,
-          to: emailLog.to,
-          tenantId: emailLog.tenantId || undefined,
-          template: emailLog.template,
-          reason: 'Spam complaint',
-          resendId: data.email_id,
-        };
-        break;
-
-      default:
-        console.log(`Unhandled Resend event type: ${type}`);
-        return;
-    }
-
-    // Update email log status
-    await this.prisma.emailLog.update({
-      where: { id: emailLog.id },
-      data: { status: newStatus },
-    });
-
-    // Notify external services
-    if (notifyEvent) {
-      await this.notifyEmailEvent(notifyEvent);
-    }
   }
 
   /**

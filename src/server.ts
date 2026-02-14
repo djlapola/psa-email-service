@@ -3,6 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { PrismaClient } from '@prisma/client';
 import emailRoutes from './routes/email.routes';
+import domainAuthRoutes from './routes/domain-auth.routes';
 import domainRoutes from './routes/domain.routes';
 import inboundRoutes from './routes/inbound.routes';
 import { QueueService } from './services/queue.service';
@@ -19,11 +20,7 @@ const queueService = new QueueService(prisma);
 // Middleware
 app.use(cors());
 
-// Raw body for webhook signature verification
-app.use('/api/webhooks/resend', express.raw({ type: 'application/json' }));
-app.use('/api/inbound/webhook', express.raw({ type: 'application/json' }));
-
-// JSON body for other routes
+// JSON body for all routes
 app.use(express.json());
 
 // Make prisma and queue available to routes
@@ -54,6 +51,7 @@ app.get('/health', async (req, res) => {
 
 // API routes
 app.use('/api', emailRoutes);
+app.use('/api/domains', domainAuthRoutes);  // BYOD custom domain auth (must be before domainRoutes for /authenticate, /verify)
 app.use('/api/domains', domainRoutes);
 app.use('/api/inbound', inboundRoutes);
 

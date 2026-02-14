@@ -396,6 +396,10 @@ Thank you for using our support services!`,
           {{commentText}}
         </div>
 
+        {{#if attachmentCount}}
+        <p style="margin: 16px 0;">&#128206; {{attachmentCount}} attachment(s) — <a href="{{portalTicketUrl}}">View in portal</a></p>
+        {{/if}}
+
         <div class="btn-wrap">
           <a href="{{ticketUrl}}" class="btn">View Ticket & Reply</a>
         </div>
@@ -415,6 +419,10 @@ Client: {{clientName}}
 Comment:
 {{commentText}}
 
+{{#if attachmentCount}}
+📎 {{attachmentCount}} attachment(s) — View in portal: {{portalTicketUrl}}
+{{/if}}
+
 View ticket & reply: {{ticketUrl}}
 
 You can reply directly to this email to respond to the comment.`,
@@ -427,6 +435,8 @@ You can reply directly to this email to respond to the comment.`,
       { name: 'commenterName', description: 'Name of person who commented', example: 'Sarah Johnson' },
       { name: 'commentText', description: 'The comment text', example: 'I have checked the server logs and found the issue...' },
       { name: 'ticketUrl', description: 'URL to view the ticket', example: 'https://portal.example.com/tickets/1234' },
+      { name: 'attachmentCount', description: 'Number of attachments on the comment (0 or omitted hides the attachment line)', example: '3' },
+      { name: 'portalTicketUrl', description: 'Portal URL for viewing attachments', example: 'https://portal.example.com/tickets/1234' },
       { name: 'companyName', description: 'Company/MSP name', example: 'Acme IT Support' },
     ],
   },

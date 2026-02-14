@@ -1,8 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { PrismaClient } from '@prisma/client';
 import { QueueService } from '../services/queue.service';
-import { WebhookService } from '../services/webhook.service';
-import { TemplateService } from '../services/template.service';
+import { TemplateService, injectAttachmentIndicator } from '../services/template.service';
 
 const router = Router();
 
@@ -19,8 +18,8 @@ const authenticate = (req: Request, res: Response, next: NextFunction) => {
 
 // Apply auth to all routes except webhooks
 router.use((req, res, next) => {
-  // Skip auth for Resend webhooks and inbound email webhooks
-  if (req.path === '/webhooks/resend' || req.path.startsWith('/inbound')) {
+  // Skip auth for inbound email webhooks
+  if (req.path.startsWith('/inbound')) {
     return next();
   }
   authenticate(req, res, next);
@@ -34,10 +33,15 @@ router.post('/send', async (req: Request, res: Response) => {
   try {
     const prisma: PrismaClient = req.app.locals.prisma;
     const templateService = new TemplateService(prisma);
-    const { to, template, data, tenantId, from, replyTo, html, text, subject, headers, cc, bcc, tags, metadata } = req.body;
+    const { to, template, data, tenantId, from, replyTo, html, text, subject, headers, cc, bcc, tags, metadata, attachments } = req.body;
 
     if (!to) {
       return res.status(400).json({ error: 'Missing required field: to' });
+    }
+
+    // Debug: log attachment data for ticket-comment emails (both paths)
+    if (template === 'ticket-comment' || (subject && data?.attachmentCount !== undefined)) {
+      console.log(`[EmailRoutes] ticket-comment send request — path: ${html ? 'raw-html' : 'template'}, attachmentCount: ${data?.attachmentCount} (${typeof data?.attachmentCount}), portalTicketUrl: ${data?.portalTicketUrl}`);
     }
 
     // Path 1: Raw HTML send (used by sendEmailWithHeaders for threading)
@@ -45,16 +49,23 @@ router.post('/send', async (req: Request, res: Response) => {
       const { SendGridService } = require('../services/sendgrid.service');
       const sendgridService = new SendGridService(prisma);
 
+      // Inject attachment indicator if data includes attachmentCount > 0
+      const withAttachments = injectAttachmentIndicator(
+        { html, text: text || '' },
+        data || {}
+      );
+
       const result = await sendgridService.sendEmail({
         to,
         subject,
-        html,
-        text: text || '',
+        html: withAttachments.html,
+        text: withAttachments.text,
         from,
         replyTo,
         tenantId,
         tags: tags ? Object.entries(tags).map(([name, value]) => ({ name, value: String(value) })) : undefined,
         headers,
+        attachments,
       });
 
       if (!result.success) {
@@ -179,7 +190,7 @@ router.get('/status/:emailId', async (req: Request, res: Response) => {
       subject: email.subject,
       template: email.template,
       status: email.status,
-      resendId: email.resendId,
+      messageId: email.sendgridMessageId,
       tenantId: email.tenantId,
       attempts: email.attempts,
       error: email.error,
@@ -477,31 +488,6 @@ function generateSampleData(variables: { name: string; example: string }[]): Rec
     {} as Record<string, string>
   );
 }
-
-/**
- * POST /api/webhooks/resend
- * Handle incoming Resend webhook events
- */
-router.post('/webhooks/resend', async (req: Request, res: Response) => {
-  try {
-    const prisma: PrismaClient = req.app.locals.prisma;
-    const webhookService = new WebhookService(prisma);
-
-    // Parse raw body
-    const payload = typeof req.body === 'string' ? req.body : req.body.toString();
-    const event = JSON.parse(payload);
-
-    console.log('Received Resend webhook:', event.type);
-
-    // Handle the webhook event
-    await webhookService.handleResendWebhook(event);
-
-    res.status(200).json({ received: true });
-  } catch (error) {
-    console.error('Error processing Resend webhook:', error);
-    res.status(400).json({ error: 'Invalid webhook payload' });
-  }
-});
 
 /**
  * GET /api/stats

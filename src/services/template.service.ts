@@ -226,7 +226,7 @@ export class TemplateService {
       /\{\{#if\s+(\w+)\}\}([\s\S]*?)\{\{\/if\}\}/g,
       (match, varName, content) => {
         const value = data[varName];
-        if (value !== undefined && value !== null && value !== '' && value !== false) {
+        if (value !== undefined && value !== null && value !== '' && value !== false && value !== 0) {
           return content;
         }
         return '';
@@ -260,4 +260,53 @@ export class TemplateService {
 
 export function createTemplateService(prisma: PrismaClient): TemplateService {
   return new TemplateService(prisma);
+}
+
+/**
+ * Inject attachment indicator into rendered HTML/text when attachments are present.
+ * Handles both template-rendered and raw HTML emails.
+ */
+export function injectAttachmentIndicator(
+  rendered: { html: string; text: string },
+  data: Record<string, unknown>
+): { html: string; text: string } {
+  const count = Number(data?.attachmentCount) || 0;
+  const portalUrl = data?.portalTicketUrl ? String(data.portalTicketUrl) : '';
+
+  if (count <= 0 || !portalUrl) {
+    return rendered;
+  }
+
+  // Skip if already injected (e.g. by template {{#if}} block)
+  if (rendered.html.includes('View in portal')) {
+    return rendered;
+  }
+
+  const htmlIndicator = `<p style="margin: 16px 0;">&#128206; ${count} attachment(s) \u2014 <a href="${portalUrl}">View in portal</a></p>`;
+  const textIndicator = `\n\u{1F4CE} ${count} attachment(s) \u2014 View in portal: ${portalUrl}\n`;
+
+  // HTML: insert before the CTA button wrapper, or before </body>
+  let html = rendered.html;
+  const btnIdx = html.indexOf('<div class="btn-wrap">');
+  if (btnIdx !== -1) {
+    html = html.slice(0, btnIdx) + htmlIndicator + '\n\n        ' + html.slice(btnIdx);
+  } else {
+    const bodyIdx = html.lastIndexOf('</body>');
+    if (bodyIdx !== -1) {
+      html = html.slice(0, bodyIdx) + htmlIndicator + '\n' + html.slice(bodyIdx);
+    } else {
+      html += htmlIndicator;
+    }
+  }
+
+  // Text: insert before "View ticket" line, or append
+  let text = rendered.text;
+  const viewIdx = text.indexOf('View ticket');
+  if (viewIdx !== -1) {
+    text = text.slice(0, viewIdx) + textIndicator + '\n' + text.slice(viewIdx);
+  } else {
+    text += textIndicator;
+  }
+
+  return { html, text };
 }

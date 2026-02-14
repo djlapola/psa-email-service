@@ -13,6 +13,12 @@ export interface SendEmailOptions {
   tenantId?: string;
   tags?: { name: string; value: string }[];
   headers?: Record<string, string>;
+  attachments?: Array<{
+    content: string;    // base64 encoded content
+    filename: string;
+    type: string;       // MIME type, e.g., 'application/pdf'
+    disposition?: string; // 'attachment' or 'inline'
+  }>;
 }
 
 export interface SendEmailResult {
@@ -29,11 +35,38 @@ export class SendGridService {
   }
 
   /**
+   * Check if a domain has been verified as a BYOD custom domain for a tenant
+   */
+  private async hasVerifiedCustomDomain(tenantId: string, emailDomain: string): Promise<boolean> {
+    try {
+      // Check BYOD custom domains first
+      const customDomain = await this.prisma.tenantEmailDomain.findUnique({
+        where: { tenantId_domain: { tenantId, domain: emailDomain.toLowerCase() } },
+      });
+      if (customDomain?.status === 'verified') return true;
+
+      // Also check if this matches the tenant's provisioned subdomain (e.g., deskside.skyrack.com)
+      const tenantConfig = await this.prisma.tenantEmailConfig.findUnique({
+        where: { tenantId },
+      });
+      if (tenantConfig?.domainVerified && tenantConfig?.domain) {
+        if (tenantConfig.domain.toLowerCase() === emailDomain.toLowerCase()) {
+          return true;
+        }
+      }
+
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Get the from address and replyTo for a given tenant
    * If tenant has a verified domain, use their custom from address
    * Otherwise, use the default with tenant's replyTo if configured
    */
-  private async getTenantEmailConfig(tenantId?: string): Promise<{
+  private async getTenantEmailConfig(tenantId?: string, requestedFrom?: string): Promise<{
     from: string;
     replyTo?: string;
   }> {
@@ -46,6 +79,24 @@ export class SendGridService {
     }
 
     try {
+      // If a specific from address was requested, check if its domain is a verified BYOD domain
+      if (requestedFrom) {
+        const fromEmail = requestedFrom.match(/<([^>]+)>/)?.[1] || requestedFrom;
+        const emailDomain = fromEmail.split('@')[1];
+        if (emailDomain) {
+          const isVerified = await this.hasVerifiedCustomDomain(tenantId, emailDomain);
+          if (isVerified) {
+            // Custom domain is verified — send from the requested address directly
+            return { from: requestedFrom };
+          }
+          // Custom domain not verified — fall back to default, set requested as replyTo
+          return {
+            from: defaultFrom,
+            replyTo: fromEmail,
+          };
+        }
+      }
+
       const tenantConfig = await this.prisma.tenantEmailConfig.findUnique({
         where: { tenantId },
       });
@@ -54,7 +105,7 @@ export class SendGridService {
         return { from: defaultFrom };
       }
 
-      // If tenant has a verified domain, use their custom from address
+      // If tenant has a verified subdomain (skyrack.com), use their configured from address
       if (tenantConfig.domainVerified && tenantConfig.fromEmail) {
         const fromName = tenantConfig.fromName || defaultFromName;
         return {
@@ -75,11 +126,11 @@ export class SendGridService {
   }
 
   async sendEmail(options: SendEmailOptions): Promise<SendEmailResult> {
-    // Get tenant-specific email configuration
-    const tenantConfig = await this.getTenantEmailConfig(options.tenantId);
+    // Get tenant-specific email configuration, passing requested from for BYOD domain check
+    const tenantConfig = await this.getTenantEmailConfig(options.tenantId, options.from);
 
-    // Use explicit from/replyTo if provided, otherwise use tenant config
-    const from = options.from || tenantConfig.from;
+    // getTenantEmailConfig resolves BYOD domains, subdomain config, and defaults
+    const from = tenantConfig.from;
     const replyTo = options.replyTo || tenantConfig.replyTo;
 
     try {
@@ -88,13 +139,22 @@ export class SendGridService {
         to: Array.isArray(options.to) ? options.to : [options.to],
         subject: options.subject,
         html: options.html,
-        text: options.text || '',
+        text: options.text || 'Please view this email in an HTML-compatible email client.',
         replyTo: replyTo,
         headers: options.headers,
       };
 
       if (options.tags && options.tags.length > 0) {
         msg.categories = options.tags.map(t => `${t.name}:${t.value}`);
+      }
+
+      if (options.attachments?.length) {
+        msg.attachments = options.attachments.map(a => ({
+          content: a.content,
+          filename: a.filename,
+          type: a.type,
+          disposition: a.disposition || 'attachment',
+        }));
       }
 
       const [response] = await sgMail.send(msg);
