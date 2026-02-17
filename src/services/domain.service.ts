@@ -103,6 +103,28 @@ class DomainService {
         errors.push(`Failed to create MX record: ${mxResult.error}`);
       }
 
+      // Step 3.5: Register SendGrid inbound parse for this subdomain
+      try {
+        const inboundParseUrl = process.env.INBOUND_PARSE_URL || `${process.env.PSA_WEBHOOK_URL || 'https://email-service'}/api/inbound/sendgrid`;
+
+        await sgClient.request({
+          method: 'POST',
+          url: '/v3/user/webhooks/parse/settings',
+          body: {
+            hostname: fullDomain,
+            url: inboundParseUrl,
+            spam_check: true,
+            send_raw: false,
+          },
+        });
+
+        console.log(`[DomainService] Inbound parse registered for ${fullDomain}`);
+      } catch (parseError: any) {
+        // Don't fail provisioning if inbound parse registration fails
+        console.error(`[DomainService] Failed to register inbound parse for ${fullDomain}:`, parseError?.response?.body || parseError.message);
+        errors.push(`Failed to register inbound parse: ${parseError.message}`);
+      }
+
       if (errors.length > 0) {
         console.error(`[DomainService] DNS record errors:`, errors);
       }
@@ -120,7 +142,7 @@ class DomainService {
           sendgridDomainId: sendgridDomainId,
           cloudflareDnsRecordIds: recordIds,
           domainVerified: false,
-          receivingEnabled: false,
+          receivingEnabled: true,
           receivingVerified: false,
         },
         update: {

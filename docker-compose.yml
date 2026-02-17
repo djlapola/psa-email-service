@@ -21,6 +21,7 @@ services:
       - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
       - CLOUDFLARE_ZONE_ID=${CLOUDFLARE_ZONE_ID}
       - BASE_DOMAIN=${BASE_DOMAIN:-skyrack.com}
+      - INBOUND_PARSE_URL=${INBOUND_PARSE_URL:-https://email-service-1017611885938.us-east1.run.app/api/inbound/sendgrid}
     networks:
       - control-plane_cp-network
     # Note: depends on cp-postgres from control-plane network
