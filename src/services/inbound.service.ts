@@ -89,7 +89,13 @@ class InboundService {
    * e.g., support@deskside.skyrack.com -> { email: 'support@deskside.skyrack.com', subdomain: 'deskside', baseDomain: 'skyrack.com' }
    */
   parseEmailAddress(email: string): ParsedEmailAddress {
-    const emailLower = email.toLowerCase().trim();
+    let cleaned = email.trim();
+    // Extract email from angle brackets if present: "Name" <email@domain.com> or <email@domain.com>
+    const angleMatch = cleaned.match(/<([^>]+)>/);
+    if (angleMatch) {
+      cleaned = angleMatch[1].trim();
+    }
+    const emailLower = cleaned.toLowerCase();
     const atIndex = emailLower.indexOf('@');
     if (atIndex === -1) {
       return { email: emailLower, subdomain: null, baseDomain: '' };
