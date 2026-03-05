@@ -227,7 +227,7 @@ class InboundService {
         method: 'GET',
         headers: {
           'Content-Type': 'application/json',
-          'X-Control-Plane-API-Key': PSA_INTERNAL_API_KEY,
+          'X-Internal-API-Key': PSA_INTERNAL_API_KEY,
           'X-Tenant-Id': tenantId,
         },
       });
@@ -364,7 +364,7 @@ class InboundService {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Control-Plane-API-Key': PSA_INTERNAL_API_KEY,
+          'X-Internal-API-Key': PSA_INTERNAL_API_KEY,
           'X-Tenant-Id': tenantId,
         },
         body: JSON.stringify({
@@ -418,7 +418,7 @@ class InboundService {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Control-Plane-API-Key': PSA_INTERNAL_API_KEY,
+          'X-Internal-API-Key': PSA_INTERNAL_API_KEY,
           'X-Tenant-Id': tenantId,
         },
         body: JSON.stringify({

@@ -25,16 +25,17 @@ export class WebhookService {
    * Send webhook notifications to CP and PSA
    */
   async notifyEmailEvent(event: EmailEvent): Promise<void> {
-    const webhookUrls: string[] = [];
+    const webhookTargets: Array<{ url: string; isPsa: boolean }> = [];
 
     // Control Plane webhook
     if (process.env.CONTROL_PLANE_WEBHOOK_URL) {
-      webhookUrls.push(process.env.CONTROL_PLANE_WEBHOOK_URL);
+      webhookTargets.push({ url: process.env.CONTROL_PLANE_WEBHOOK_URL, isPsa: false });
     }
 
-    // PSA webhook
-    if (process.env.PSA_WEBHOOK_URL) {
-      webhookUrls.push(process.env.PSA_WEBHOOK_URL);
+    // PSA webhook — construct from PSA_INTERNAL_API_URL to target the correct endpoint
+    const psaBaseUrl = process.env.PSA_INTERNAL_API_URL;
+    if (psaBaseUrl) {
+      webhookTargets.push({ url: `${psaBaseUrl}/email-events`, isPsa: true });
     }
 
     // Only send webhooks for important events
@@ -43,15 +44,15 @@ export class WebhookService {
       return;
     }
 
-    for (const url of webhookUrls) {
-      await this.sendWebhook(url, event);
+    for (const target of webhookTargets) {
+      await this.sendWebhook(target.url, event, target.isPsa);
     }
   }
 
   /**
    * Send a webhook to a specific URL with retry logic
    */
-  private async sendWebhook(url: string, event: EmailEvent): Promise<void> {
+  private async sendWebhook(url: string, event: EmailEvent, isPsa = false): Promise<void> {
     // Create delivery record
     const delivery = await this.prisma.webhookDelivery.create({
       data: {
@@ -63,7 +64,7 @@ export class WebhookService {
       },
     });
 
-    await this.attemptWebhookDelivery(delivery.id, url, event);
+    await this.attemptWebhookDelivery(delivery.id, url, event, 1, isPsa);
   }
 
   /**
@@ -73,19 +74,27 @@ export class WebhookService {
     deliveryId: string,
     url: string,
     event: EmailEvent,
-    attempt = 1
+    attempt = 1,
+    isPsa = false,
   ): Promise<void> {
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), WEBHOOK_TIMEOUT);
 
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'X-Email-Service-Event': event.event,
+        'X-Email-Service-Signature': this.generateSignature(event),
+      };
+
+      // Include auth header for PSA-bound webhooks
+      if (isPsa && process.env.PSA_INTERNAL_API_KEY) {
+        headers['X-Internal-API-Key'] = process.env.PSA_INTERNAL_API_KEY;
+      }
+
       const response = await fetch(url, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Email-Service-Event': event.event,
-          'X-Email-Service-Signature': this.generateSignature(event),
-        },
+        headers,
         body: JSON.stringify(event),
         signal: controller.signal,
       });
@@ -121,7 +130,7 @@ export class WebhookService {
       if (attempt < MAX_WEBHOOK_RETRIES) {
         const delay = Math.pow(2, attempt) * 1000; // Exponential backoff
         setTimeout(() => {
-          this.attemptWebhookDelivery(deliveryId, url, event, attempt + 1);
+          this.attemptWebhookDelivery(deliveryId, url, event, attempt + 1, isPsa);
         }, delay);
       } else {
         await this.prisma.webhookDelivery.update({
@@ -138,7 +147,7 @@ export class WebhookService {
    */
   private generateSignature(event: EmailEvent): string {
     const crypto = require('crypto');
-    const secret = process.env.EMAIL_SERVICE_API_KEY || 'default-secret';
+    const secret = process.env.EMAIL_SERVICE_WEBHOOK_SECRET || 'default-secret';
     return crypto
       .createHmac('sha256', secret)
       .update(JSON.stringify(event))
