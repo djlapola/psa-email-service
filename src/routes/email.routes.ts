@@ -1,7 +1,9 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { PrismaClient } from '@prisma/client';
+import crypto from 'crypto';
 import { QueueService } from '../services/queue.service';
 import { TemplateService, injectAttachmentIndicator } from '../services/template.service';
+import { WebhookService } from '../services/webhook.service';
 
 const router = Router();
 
@@ -18,8 +20,8 @@ const authenticate = (req: Request, res: Response, next: NextFunction) => {
 
 // Apply auth to all routes except webhooks
 router.use((req, res, next) => {
-  // Skip auth for inbound email webhooks
-  if (req.path.startsWith('/inbound')) {
+  // Skip auth for inbound email webhooks and SendGrid event webhooks
+  if (req.path.startsWith('/inbound') || req.path.startsWith('/webhooks')) {
     return next();
   }
   authenticate(req, res, next);
@@ -55,6 +57,21 @@ router.post('/send', async (req: Request, res: Response) => {
         data || {}
       );
 
+      // Create EmailLog record so raw sends appear in stats/logs
+      const resolvedFrom = from || process.env.EMAIL_FROM || 'noreply@skyrack.com';
+      const log = await prisma.emailLog.create({
+        data: {
+          to: Array.isArray(to) ? to.join(', ') : to,
+          from: resolvedFrom,
+          subject,
+          template: template || 'raw-html',
+          status: 'sending',
+          tenantId,
+          metadata: data as object || {},
+          attempts: 1,
+        },
+      });
+
       const result = await sendgridService.sendEmail({
         to,
         subject,
@@ -69,13 +86,26 @@ router.post('/send', async (req: Request, res: Response) => {
       });
 
       if (!result.success) {
+        await prisma.emailLog.update({
+          where: { id: log.id },
+          data: { status: 'failed', error: result.error },
+        });
         return res.status(500).json({ error: result.error });
       }
+
+      await prisma.emailLog.update({
+        where: { id: log.id },
+        data: {
+          status: 'sent',
+          sendgridMessageId: result.messageId,
+          sentAt: new Date(),
+        },
+      });
 
       return res.status(202).json({
         success: true,
         message: 'Email sent',
-        emailId: result.messageId,
+        emailId: log.id,
       });
     }
 
@@ -502,8 +532,9 @@ router.get('/stats', async (req: Request, res: Response) => {
     if (tenantId) where.tenantId = tenantId;
     if (since) where.createdAt = { gte: new Date(since as string) };
 
-    const [total, byStatus, byTemplate] = await Promise.all([
+    const [total, totalUnfiltered, byStatus, byTemplate] = await Promise.all([
       prisma.emailLog.count({ where }),
+      prisma.emailLog.count(),
       prisma.emailLog.groupBy({
         by: ['status'],
         where,
@@ -533,12 +564,120 @@ router.get('/stats', async (req: Request, res: Response) => {
 
     res.json({
       total,
+      totalUnfiltered,
       byStatus: statusCounts,
       byTemplate: templateCounts,
     });
   } catch (error) {
     console.error('Error fetching email stats:', error);
     res.status(500).json({ error: 'Failed to fetch email stats' });
+  }
+});
+
+/**
+ * POST /api/webhooks/sendgrid
+ * Handle SendGrid Event Webhook (delivery, bounce, open, etc.)
+ * Public endpoint — verified via SENDGRID_WEBHOOK_SECRET signature
+ */
+router.post('/webhooks/sendgrid', async (req: Request, res: Response) => {
+  try {
+    const prisma: PrismaClient = req.app.locals.prisma;
+
+    // Verify SendGrid webhook signature if secret is configured
+    const webhookSecret = process.env.SENDGRID_WEBHOOK_SECRET;
+    if (webhookSecret) {
+      const signature = req.headers['x-twilio-email-event-webhook-signature'] as string;
+      const timestamp = req.headers['x-twilio-email-event-webhook-timestamp'] as string;
+
+      if (!signature || !timestamp) {
+        return res.status(401).json({ error: 'Missing webhook signature headers' });
+      }
+
+      // Verify HMAC signature: HMAC-SHA256(timestamp + payload, secret)
+      const payload = JSON.stringify(req.body);
+      const expectedSignature = crypto
+        .createHmac('sha256', webhookSecret)
+        .update(timestamp + payload)
+        .digest('base64');
+
+      if (signature !== expectedSignature) {
+        console.warn('SendGrid webhook signature verification failed');
+        return res.status(401).json({ error: 'Invalid webhook signature' });
+      }
+    }
+
+    const events = Array.isArray(req.body) ? req.body : [req.body];
+    const webhookService = new WebhookService(prisma);
+
+    for (const event of events) {
+      const sgMessageId = event.sg_message_id?.split('.')[0]; // SendGrid appends .filter info
+      const eventType = event.event; // delivered, bounce, dropped, deferred, open, click, etc.
+
+      if (!sgMessageId) continue;
+
+      // Find the EmailLog by sendgridMessageId
+      const emailLog = await prisma.emailLog.findFirst({
+        where: { sendgridMessageId: sgMessageId },
+      });
+
+      if (!emailLog) {
+        console.log(`SendGrid webhook: no EmailLog found for sg_message_id=${sgMessageId}`);
+        continue;
+      }
+
+      // Map SendGrid events to our status values
+      let newStatus: string | null = null;
+      let webhookEvent: string | null = null;
+
+      switch (eventType) {
+        case 'delivered':
+          newStatus = 'delivered';
+          break;
+        case 'bounce':
+        case 'dropped':
+          newStatus = 'bounced';
+          webhookEvent = 'email.bounced';
+          break;
+        case 'spamreport':
+          newStatus = 'complained';
+          webhookEvent = 'email.complained';
+          break;
+        case 'deferred':
+          // Don't change status for deferred, just log
+          console.log(`SendGrid webhook: email ${emailLog.id} deferred — ${event.reason || 'no reason'}`);
+          continue;
+      }
+
+      if (newStatus) {
+        await prisma.emailLog.update({
+          where: { id: emailLog.id },
+          data: {
+            status: newStatus,
+            error: event.reason || event.response || undefined,
+          },
+        });
+        console.log(`SendGrid webhook: email ${emailLog.id} status updated to ${newStatus}`);
+      }
+
+      // Notify CP/PSA about bounces and complaints
+      if (webhookEvent) {
+        await webhookService.notifyEmailEvent({
+          event: webhookEvent as any,
+          emailId: emailLog.id,
+          to: emailLog.to,
+          tenantId: emailLog.tenantId || undefined,
+          template: emailLog.template,
+          reason: event.reason || event.response,
+        });
+      }
+    }
+
+    // Always return 200 to prevent SendGrid retries
+    res.status(200).json({ received: true });
+  } catch (error) {
+    console.error('Error processing SendGrid webhook:', error);
+    // Still return 200 to prevent infinite retries from SendGrid
+    res.status(200).json({ received: true });
   }
 });
 
