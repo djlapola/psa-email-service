@@ -1,6 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { PrismaClient } from '@prisma/client';
-import crypto from 'crypto';
+import { EventWebhook, EventWebhookHeader } from '@sendgrid/eventwebhook';
 import { QueueService } from '../services/queue.service';
 import { TemplateService, injectAttachmentIndicator } from '../services/template.service';
 import { WebhookService } from '../services/webhook.service';
@@ -583,30 +583,32 @@ router.post('/webhooks/sendgrid', async (req: Request, res: Response) => {
   try {
     const prisma: PrismaClient = req.app.locals.prisma;
 
-    // Verify SendGrid webhook signature if secret is configured
-    const webhookSecret = process.env.SENDGRID_WEBHOOK_SECRET;
-    if (webhookSecret) {
-      const signature = req.headers['x-twilio-email-event-webhook-signature'] as string;
-      const timestamp = req.headers['x-twilio-email-event-webhook-timestamp'] as string;
+    // Verify SendGrid Event Webhook signature (ECDSA) if verification key is configured
+    const verificationKey = process.env.SENDGRID_WEBHOOK_VERIFICATION_KEY || process.env.SENDGRID_WEBHOOK_SECRET;
+    if (verificationKey) {
+      const signature = req.headers[EventWebhookHeader.SIGNATURE().toLowerCase()] as string;
+      const timestamp = req.headers[EventWebhookHeader.TIMESTAMP().toLowerCase()] as string;
 
       if (!signature || !timestamp) {
         return res.status(401).json({ error: 'Missing webhook signature headers' });
       }
 
-      // Verify HMAC signature: HMAC-SHA256(timestamp + payload, secret)
-      const payload = JSON.stringify(req.body);
-      const expectedSignature = crypto
-        .createHmac('sha256', webhookSecret)
-        .update(timestamp + payload)
-        .digest('base64');
+      const eventWebhook = new EventWebhook();
+      const ecPublicKey = eventWebhook.convertPublicKeyToECDSA(verificationKey);
+      const payload = (req.body as Buffer).toString();
 
-      if (signature !== expectedSignature) {
-        console.warn('SendGrid webhook signature verification failed');
+      if (!eventWebhook.verifySignature(ecPublicKey, payload, signature, timestamp)) {
+        console.warn('SendGrid webhook ECDSA signature verification failed');
         return res.status(401).json({ error: 'Invalid webhook signature' });
       }
+    } else {
+      console.warn('SENDGRID_WEBHOOK_VERIFICATION_KEY not set — skipping webhook signature verification');
     }
 
-    const events = Array.isArray(req.body) ? req.body : [req.body];
+    // req.body is a raw Buffer from express.raw(); parse it to get the events array
+    const rawBody = Buffer.isBuffer(req.body) ? req.body.toString() : JSON.stringify(req.body);
+    const parsedBody = JSON.parse(rawBody);
+    const events = Array.isArray(parsedBody) ? parsedBody : [parsedBody];
     const webhookService = new WebhookService(prisma);
 
     for (const event of events) {

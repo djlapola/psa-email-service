@@ -20,7 +20,11 @@ const queueService = new QueueService(prisma);
 // Middleware
 app.use(cors());
 
-// JSON body for all routes
+// Raw body parser for SendGrid Event Webhook (MUST be before express.json())
+// This route needs the raw request body for ECDSA signature verification.
+app.use('/api/webhooks/sendgrid', express.raw({ type: 'application/json' }));
+
+// JSON body for all other routes
 app.use(express.json());
 
 // Make prisma and queue available to routes
