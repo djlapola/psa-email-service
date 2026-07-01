@@ -440,6 +440,59 @@ You can reply directly to this email to respond to the comment.`,
       { name: 'companyName', description: 'Company/MSP name', example: 'Acme IT Support' },
     ],
   },
+  {
+    name: 'ticket-merged',
+    displayName: 'Ticket Merged',
+    description: 'Sent to the client contact when their ticket is merged into another ticket',
+    subject: '[{{sourceTicketNumber}}] Ticket Merged into {{targetTicketNumber}}',
+    htmlBody: wrapTemplate(`
+        <h2>Your Ticket Has Been Merged</h2>
+        <p>Hi {{contactFirstName}},</p>
+        <p>Your support ticket <strong>{{sourceTicketNumber}}</strong> ("{{subject}}") has been merged into ticket <strong>{{targetTicketNumber}}</strong>.</p>
+
+        <div class="info-box info-box-blue">
+          <table class="info-table">
+            <tr><td class="label">Original Ticket</td><td class="value">{{sourceTicketNumber}}</td></tr>
+            <tr><td class="label">Merged Into</td><td class="value">{{targetTicketNumber}}</td></tr>
+            <tr><td class="label">Subject</td><td class="value">{{subject}}</td></tr>
+            <tr><td class="label">Client</td><td class="value">{{clientName}}</td></tr>
+          </table>
+        </div>
+
+        <p>All future updates will be on ticket <strong>{{targetTicketNumber}}</strong>, and you have been added as a watcher so you'll continue to receive notifications.</p>
+
+        <div class="btn-wrap">
+          <a href="{{targetTicketUrl}}" class="btn">View Ticket</a>
+        </div>
+
+        <p>If you have any questions, simply reply to this email or click the button above.</p>
+    `, '{{tenantName}}'),
+    textBody: `Your Ticket Has Been Merged
+
+Hi {{contactFirstName}},
+
+Your support ticket {{sourceTicketNumber}} ("{{subject}}") has been merged into ticket {{targetTicketNumber}}.
+
+Original Ticket: {{sourceTicketNumber}}
+Merged Into: {{targetTicketNumber}}
+Subject: {{subject}}
+Client: {{clientName}}
+
+All future updates will be on ticket {{targetTicketNumber}}, and you have been added as a watcher so you'll continue to receive notifications.
+
+View ticket: {{targetTicketUrl}}
+
+If you have any questions, simply reply to this email.`,
+    variables: [
+      { name: 'sourceTicketNumber', description: 'The original ticket number that was merged', example: 'TKT-1234' },
+      { name: 'targetTicketNumber', description: 'The ticket number it was merged into', example: 'TKT-5678' },
+      { name: 'subject', description: 'Subject line of the original ticket', example: 'Cannot access email' },
+      { name: 'clientName', description: 'Name of the client company', example: 'Acme Corp' },
+      { name: 'contactFirstName', description: 'First name of the contact', example: 'John' },
+      { name: 'targetTicketUrl', description: 'URL to view the target ticket', example: 'https://portal.example.com/tickets/5678' },
+      { name: 'tenantName', description: 'Name of the MSP/tenant', example: 'Acme IT Support' },
+    ],
+  },
 
   // ============ CONTROL PLANE TEMPLATES ============
   {
