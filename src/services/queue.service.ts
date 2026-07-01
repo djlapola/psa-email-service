@@ -48,13 +48,11 @@ export class QueueService {
       throw new Error(`Template not found: ${email.template}`);
     }
 
-    const from = email.from || process.env.EMAIL_FROM || 'noreply@example.com';
-
-    // Create log entry
+    // Create log entry (from is a placeholder; updated post-send with the resolved address)
     const log = await this.prisma.emailLog.create({
       data: {
         to: email.to,
-        from,
+        from: email.from || process.env.EMAIL_FROM || 'noreply@example.com',
         subject: rendered.subject,
         template: email.template,
         status: 'queued',
@@ -64,14 +62,15 @@ export class QueueService {
       },
     });
 
-    // Add to in-memory queue
+    // Add to in-memory queue — do NOT default from; let getTenantEmailConfig
+    // resolve the tenant's branded address when no explicit from was provided
     this.queue.push({
       id: log.id,
       to: email.to,
       template: email.template,
       data: email.data,
       tenantId: email.tenantId,
-      from,
+      from: email.from,
       replyTo: email.replyTo,
     });
 
@@ -168,6 +167,7 @@ export class QueueService {
           status: 'sent',
           sendgridMessageId: result.messageId,
           sentAt: new Date(),
+          ...(result.from && { from: result.from }),
         },
       });
       console.log(`Email sent: ${email.id} -> ${email.to} (messageId: ${result.messageId})`);

@@ -25,6 +25,7 @@ export interface SendEmailResult {
   success: boolean;
   messageId?: string;
   error?: string;
+  from?: string;
 }
 
 export class SendGridService {
@@ -162,11 +163,12 @@ export class SendGridService {
       return {
         success: true,
         messageId: response.headers['x-message-id'] as string,
+        from,
       };
     } catch (error: any) {
       const errorMessage = error?.response?.body?.errors?.[0]?.message || error?.message || 'Unknown error';
       console.error('SendGrid API error:', errorMessage);
-      return { success: false, error: errorMessage };
+      return { success: false, error: errorMessage, from };
     }
   }
 }
