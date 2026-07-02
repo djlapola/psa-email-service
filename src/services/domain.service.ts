@@ -138,7 +138,7 @@ class DomainService {
           tenantId,
           domain: fullDomain,
           fromEmail: `support@${fullDomain}`,
-          fromName: `${subdomain} Support`,
+          fromName: `${subdomain.charAt(0).toUpperCase()}${subdomain.slice(1)} Support`,
           sendgridDomainId: sendgridDomainId,
           cloudflareDnsRecordIds: recordIds,
           domainVerified: false,
