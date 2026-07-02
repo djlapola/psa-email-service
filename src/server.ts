@@ -91,20 +91,35 @@ const MIGRATION_STATEMENTS: string[] = [
 ];
 
 async function runMigrationsIfNeeded() {
-  await prisma.$executeRawUnsafe(`CREATE TABLE IF NOT EXISTS "_migration_state" (
-    "key" TEXT NOT NULL PRIMARY KEY,
-    "hash" TEXT NOT NULL,
-    "appliedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
-  )`);
+  console.log('[Migrations] prismaVersion:', require('@prisma/client').Prisma.prismaVersion);
+
+  try {
+    await prisma.$executeRawUnsafe(`CREATE TABLE IF NOT EXISTS "_migration_state" (
+      "key" TEXT NOT NULL PRIMARY KEY,
+      "hash" TEXT NOT NULL,
+      "appliedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`);
+  } catch (err: any) {
+    console.error(`[Migrations] FAILED at: create _migration_state`, '| message:', err?.message || '(empty)', '| code:', err?.code, '| meta:', JSON.stringify(err?.meta), '| clientVersion:', err?.clientVersion);
+    console.error('[Migrations] full:', JSON.stringify(err, Object.getOwnPropertyNames(err)));
+    throw err;
+  }
 
   const migrationHash = crypto
     .createHash('sha256')
     .update(MIGRATION_STATEMENTS.join('\n'))
     .digest('hex');
 
-  const existing: { hash: string }[] = await prisma.$queryRawUnsafe(
-    `SELECT "hash" FROM "_migration_state" WHERE "key" = 'main'`
-  );
+  let existing: { hash: string }[];
+  try {
+    existing = await prisma.$queryRawUnsafe(
+      `SELECT "hash" FROM "_migration_state" WHERE "key" = 'main'`
+    );
+  } catch (err: any) {
+    console.error(`[Migrations] FAILED at: read hash`, '| message:', err?.message || '(empty)', '| code:', err?.code, '| meta:', JSON.stringify(err?.meta), '| clientVersion:', err?.clientVersion);
+    console.error('[Migrations] full:', JSON.stringify(err, Object.getOwnPropertyNames(err)));
+    throw err;
+  }
 
   if (existing.length > 0 && existing[0].hash === migrationHash) {
     console.log(`[Migrations] Already up to date (${MIGRATION_STATEMENTS.length} statements, hash ${migrationHash.slice(0, 8)}), skipping`);
@@ -120,10 +135,16 @@ async function runMigrationsIfNeeded() {
       console.error(`[Migrations] Statement failed (continuing): ${err.message}`);
     }
   }
-  await prisma.$executeRawUnsafe(
-    `INSERT INTO "_migration_state" ("key", "hash", "appliedAt") VALUES ('main', $1, NOW()) ON CONFLICT ("key") DO UPDATE SET "hash" = $1, "appliedAt" = NOW()`,
-    migrationHash
-  );
+  try {
+    await prisma.$executeRawUnsafe(
+      `INSERT INTO "_migration_state" ("key", "hash", "appliedAt") VALUES ('main', $1, NOW()) ON CONFLICT ("key") DO UPDATE SET "hash" = $1, "appliedAt" = NOW()`,
+      migrationHash
+    );
+  } catch (err: any) {
+    console.error(`[Migrations] FAILED at: write hash`, '| message:', err?.message || '(empty)', '| code:', err?.code, '| meta:', JSON.stringify(err?.meta), '| clientVersion:', err?.clientVersion);
+    console.error('[Migrations] full:', JSON.stringify(err, Object.getOwnPropertyNames(err)));
+    throw err;
+  }
   console.log(`[Migrations] Completed in ${Date.now() - start}ms`);
 }
 
@@ -133,7 +154,7 @@ app.listen(port, async () => {
   try {
     await runMigrationsIfNeeded();
   } catch (err: any) {
-    console.error('[Migrations] Fatal:', err.message);
+    console.error('[Migrations] Fatal:', err?.message || '(empty)', '| code:', err?.code, '| full:', JSON.stringify(err, Object.getOwnPropertyNames(err)));
   }
   await queueService.loadPendingEmails();
   queueService.start();
