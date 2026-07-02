@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import crypto from 'crypto';
 import { PrismaClient } from '@prisma/client';
 import emailRoutes from './routes/email.routes';
 import domainAuthRoutes from './routes/domain-auth.routes';
@@ -80,9 +81,60 @@ process.on('SIGINT', async () => {
   process.exit(0);
 });
 
+// Idempotent schema migrations applied at startup.
+// Mirrors the PSA backend pattern: a hash of the statements is stored in
+// "_migration_state" so warm instances skip re-running when nothing changed.
+// Every statement MUST be idempotent (IF NOT EXISTS / ADD COLUMN IF NOT EXISTS)
+// because failures are logged and skipped rather than aborting startup.
+const MIGRATION_STATEMENTS: string[] = [
+  // empty for now — real ALTER/CREATE statements added in the next task
+];
+
+async function runMigrationsIfNeeded() {
+  await prisma.$executeRawUnsafe(`CREATE TABLE IF NOT EXISTS "_migration_state" (
+    "key" TEXT NOT NULL PRIMARY KEY,
+    "hash" TEXT NOT NULL,
+    "appliedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  const migrationHash = crypto
+    .createHash('sha256')
+    .update(MIGRATION_STATEMENTS.join('\n'))
+    .digest('hex');
+
+  const existing: { hash: string }[] = await prisma.$queryRawUnsafe(
+    `SELECT "hash" FROM "_migration_state" WHERE "key" = 'main'`
+  );
+
+  if (existing.length > 0 && existing[0].hash === migrationHash) {
+    console.log(`[Migrations] Already up to date (${MIGRATION_STATEMENTS.length} statements, hash ${migrationHash.slice(0, 8)}), skipping`);
+    return;
+  }
+
+  console.log(`[Migrations] Running ${MIGRATION_STATEMENTS.length} statements...`);
+  const start = Date.now();
+  for (const sql of MIGRATION_STATEMENTS) {
+    try {
+      await prisma.$executeRawUnsafe(sql);
+    } catch (err: any) {
+      console.error(`[Migrations] Statement failed (continuing): ${err.message}`);
+    }
+  }
+  await prisma.$executeRawUnsafe(
+    `INSERT INTO "_migration_state" ("key", "hash", "appliedAt") VALUES ('main', $1, NOW()) ON CONFLICT ("key") DO UPDATE SET "hash" = $1, "appliedAt" = NOW()`,
+    migrationHash
+  );
+  console.log(`[Migrations] Completed in ${Date.now() - start}ms`);
+}
+
 // Start server
 app.listen(port, async () => {
   console.log(`Email service running on port ${port}`);
+  try {
+    await runMigrationsIfNeeded();
+  } catch (err: any) {
+    console.error('[Migrations] Fatal:', err.message);
+  }
   await queueService.loadPendingEmails();
   queueService.start();
 });
