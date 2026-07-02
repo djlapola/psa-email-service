@@ -90,6 +90,24 @@ const MIGRATION_STATEMENTS: string[] = [
   // empty for now — real ALTER/CREATE statements added in the next task
 ];
 
+// Warm the Prisma connection pool before the first migration DDL runs.
+// On cold start against the private-IP prod DB, the initial connection can
+// exceed the 10s pool-acquire timeout (connection_limit=5); a bounded retry
+// gives the pool time to establish a live connection first.
+async function waitForDatabase(maxAttempts = 5): Promise<void> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await prisma.$queryRaw`SELECT 1`;
+      console.log(`[Startup] Database connection established (attempt ${attempt})`);
+      return;
+    } catch (err: any) {
+      console.warn(`[Startup] DB not ready (attempt ${attempt}/${maxAttempts}): ${err?.message || err}`);
+      if (attempt === maxAttempts) throw err;
+      await new Promise(r => setTimeout(r, 2000 * attempt)); // backoff 2s,4s,6s,8s
+    }
+  }
+}
+
 async function runMigrationsIfNeeded() {
   console.log('[Migrations] prismaVersion:', require('@prisma/client').Prisma.prismaVersion);
 
@@ -152,9 +170,10 @@ async function runMigrationsIfNeeded() {
 app.listen(port, async () => {
   console.log(`Email service running on port ${port}`);
   try {
+    await waitForDatabase();
     await runMigrationsIfNeeded();
   } catch (err: any) {
-    console.error('[Migrations] Fatal:', err?.message || '(empty)', '| code:', err?.code, '| full:', JSON.stringify(err, Object.getOwnPropertyNames(err)));
+    console.error('[Migrations] Skipped — DB not ready or migration failed:', err?.message);
   }
   await queueService.loadPendingEmails();
   queueService.start();
