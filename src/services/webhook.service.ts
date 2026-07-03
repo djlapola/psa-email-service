@@ -11,6 +11,28 @@ export interface EmailEvent {
   messageId?: string;
 }
 
+export interface DomainHealthFailingRecord {
+  recordType: string;  // e.g. CNAME / TXT / MX
+  host: string;        // expected DNS host (from SendGrid whitelabel dns object)
+  value: string;       // expected DNS value (from SendGrid whitelabel dns object)
+  reason: string;      // why the record is failing (from SendGrid validation_results)
+}
+
+/**
+ * Emitted to Control Plane when the domain-health sweep detects a domain that is
+ * stuck unverified ('unverified') or whose authenticated DNS records drifted ('drift').
+ * CP resolves the alert tenant by `psaTenantId`, so `tenantId` MUST be the PSA tenant id.
+ */
+export interface DomainHealthEvent {
+  type: 'domain.health';
+  tenantId: string;    // PSA tenant id (tenant_email_configs.tenantId)
+  subdomain: string;
+  domain: string;
+  status: 'unverified' | 'drift';
+  failingRecords: DomainHealthFailingRecord[];
+  message: string;
+}
+
 const MAX_WEBHOOK_RETRIES = 3;
 const WEBHOOK_TIMEOUT = 10000; // 10 seconds
 
@@ -143,9 +165,57 @@ export class WebhookService {
   }
 
   /**
+   * Emit a domain.health anomaly to Control Plane, reusing the existing signed-POST
+   * pattern (HMAC-SHA256 signature + X-Email-Service-* headers). Best-effort with the
+   * same retry/backoff as email events; never throws.
+   */
+  async notifyDomainHealth(event: DomainHealthEvent): Promise<void> {
+    const url = process.env.CONTROL_PLANE_WEBHOOK_URL;
+    if (!url) {
+      console.warn('[Webhook] CONTROL_PLANE_WEBHOOK_URL not set; skipping domain.health emit');
+      return;
+    }
+
+    for (let attempt = 1; attempt <= MAX_WEBHOOK_RETRIES; attempt++) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), WEBHOOK_TIMEOUT);
+
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Email-Service-Event': event.type,
+            'X-Email-Service-Signature': this.generateSignature(event),
+          },
+          body: JSON.stringify(event),
+          signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
+
+        if (response.ok) {
+          console.log(`[Webhook] domain.health (${event.status}) delivered to CP for ${event.domain}`);
+          return;
+        }
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        console.error(`[Webhook] domain.health delivery failed (attempt ${attempt}/${MAX_WEBHOOK_RETRIES}) for ${event.domain}: ${errorMessage}`);
+        if (attempt < MAX_WEBHOOK_RETRIES) {
+          const delay = Math.pow(2, attempt) * 1000; // Exponential backoff
+          await new Promise(r => setTimeout(r, delay));
+        } else {
+          console.error(`[Webhook] domain.health permanently failed for ${event.domain}`);
+        }
+      }
+    }
+  }
+
+  /**
    * Generate a simple signature for webhook verification
    */
-  private generateSignature(event: EmailEvent): string {
+  private generateSignature(event: EmailEvent | DomainHealthEvent): string {
     const crypto = require('crypto');
     const secret = process.env.EMAIL_SERVICE_WEBHOOK_SECRET || 'default-secret';
     return crypto

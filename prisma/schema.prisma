@@ -59,6 +59,7 @@ model TenantEmailConfig {
   cloudflareDnsRecordIds Json?    // Array of Cloudflare record IDs for cleanup
   receivingEnabled       Boolean  @default(false)  // Whether inbound email is enabled
   receivingVerified      Boolean  @default(false)  // Whether MX record is verified
+  lastHealthAlertAt      DateTime?                  // Last time a domain.health anomaly was emitted to CP (dedup)
   createdAt              DateTime @default(now())
   updatedAt              DateTime @updatedAt
 

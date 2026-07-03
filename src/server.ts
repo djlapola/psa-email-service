@@ -8,6 +8,9 @@ import domainAuthRoutes from './routes/domain-auth.routes';
 import domainRoutes from './routes/domain.routes';
 import inboundRoutes from './routes/inbound.routes';
 import { QueueService } from './services/queue.service';
+import { createDomainService } from './services/domain.service';
+import { createWebhookService } from './services/webhook.service';
+import { createDomainHealthService } from './services/domain-health.service';
 
 dotenv.config();
 
@@ -17,6 +20,14 @@ const port = process.env.PORT || 4001;
 
 // Initialize queue service
 const queueService = new QueueService(prisma);
+
+// Domain-health background job (unverified-stuck + DNS-drift detection → CP)
+const domainHealthService = createDomainHealthService(
+  prisma,
+  createDomainService(prisma),
+  createWebhookService(prisma),
+);
+const DOMAIN_HEALTH_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6h
 
 // Middleware
 app.use(cors());
@@ -87,7 +98,7 @@ process.on('SIGINT', async () => {
 // Every statement MUST be idempotent (IF NOT EXISTS / ADD COLUMN IF NOT EXISTS)
 // because failures are logged and skipped rather than aborting startup.
 const MIGRATION_STATEMENTS: string[] = [
-  // empty for now — real ALTER/CREATE statements added in the next task
+  `ALTER TABLE "tenant_email_configs" ADD COLUMN IF NOT EXISTS "lastHealthAlertAt" TIMESTAMP(3)`,
 ];
 
 // Warm the Prisma connection pool before the first migration DDL runs.
@@ -177,6 +188,17 @@ app.listen(port, async () => {
   }
   await queueService.loadPendingEmails();
   queueService.start();
+
+  // Domain-health sweeps: run once at startup (non-blocking) then every 6h.
+  // Best-effort — a sweep failure is logged and never crashes the service.
+  domainHealthService
+    .runDomainHealthSweep()
+    .catch(err => console.error('[DomainHealth] Initial sweep failed:', err?.message || err));
+  setInterval(() => {
+    domainHealthService
+      .runDomainHealthSweep()
+      .catch(err => console.error('[DomainHealth] Scheduled sweep failed:', err?.message || err));
+  }, DOMAIN_HEALTH_INTERVAL_MS);
 });
 
 export { app, prisma };
