@@ -10,6 +10,7 @@ export interface QueuedEmail {
   data: Record<string, unknown>;
   tenantId?: string;
   from?: string;
+  fromPrefix?: string;
   replyTo?: string;
 }
 
@@ -52,7 +53,7 @@ export class QueueService {
     const log = await this.prisma.emailLog.create({
       data: {
         to: email.to,
-        from: email.from || process.env.EMAIL_FROM || 'noreply@example.com',
+        from: email.from || 'pending-resolution',
         subject: rendered.subject,
         template: email.template,
         status: 'queued',
@@ -71,6 +72,7 @@ export class QueueService {
       data: email.data,
       tenantId: email.tenantId,
       from: email.from,
+      fromPrefix: email.fromPrefix,
       replyTo: email.replyTo,
     });
 
@@ -155,6 +157,7 @@ export class QueueService {
       html: rendered.html,
       text: rendered.text,
       from: email.from,
+      fromPrefix: email.fromPrefix,
       replyTo: email.replyTo,
       tenantId: email.tenantId,
       tags: email.tenantId ? [{ name: 'tenant_id', value: email.tenantId }] : undefined,

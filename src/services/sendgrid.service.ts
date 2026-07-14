@@ -9,6 +9,7 @@ export interface SendEmailOptions {
   html: string;
   text?: string;
   from?: string;
+  fromPrefix?: string;
   replyTo?: string;
   tenantId?: string;
   tags?: { name: string; value: string }[];
@@ -67,7 +68,7 @@ export class SendGridService {
    * If tenant has a verified domain, use their custom from address
    * Otherwise, use the default with tenant's replyTo if configured
    */
-  private async getTenantEmailConfig(tenantId?: string, requestedFrom?: string): Promise<{
+  private async getTenantEmailConfig(tenantId?: string, requestedFrom?: string, fromPrefix?: string): Promise<{
     from: string;
     replyTo?: string;
   }> {
@@ -102,13 +103,51 @@ export class SendGridService {
         where: { tenantId },
       });
 
-      if (!tenantConfig) {
-        return { from: defaultFrom };
+      // Resolve the display name once, independent of which sending path wins.
+      const fromName = tenantConfig?.fromName || defaultFromName;
+
+      // Caller-supplied local-part: compose the address on the tenant's own verified
+      // subdomain. Sanitize to a safe local-part and cap length.
+      if (fromPrefix) {
+        const sanitized = fromPrefix.toLowerCase().replace(/[^a-z0-9.-]/g, '').slice(0, 64);
+        // Only compose against a VERIFIED subdomain. fromPrefix must NEVER be composed
+        // against a BYOD domain from tenant_email_domains: a tenant configures exactly one
+        // BYOD address (byodFromEmail), so synthesizing other local-parts on their domain
+        // could produce an address that does not exist at their mail provider. Subdomain only.
+        if (sanitized && tenantConfig?.domainVerified && tenantConfig.domain) {
+          return {
+            from: `${fromName} <${sanitized}@${tenantConfig.domain}>`,
+            replyTo: tenantConfig?.replyTo || undefined,
+          };
+        }
+        // Otherwise fall through to the normal resolution (do NOT compose against an
+        // unverified domain).
+      }
+
+      // BYOD first: prefer a verified custom domain that has a configured from address.
+      // A verified row with a NULL byodFromEmail must not be used (filtered out below);
+      // never synthesize a local-part.
+      const byod = await this.prisma.tenantEmailDomain.findFirst({
+        where: { tenantId, status: 'verified', byodFromEmail: { not: null } },
+        orderBy: [{ isDefault: 'desc' }, { verifiedAt: 'desc' }],
+      });
+      if (byod?.byodFromEmail) {
+        // BYOD is SEND-ONLY: it authenticates whitelabel CNAMEs but adds no MX and no
+        // Inbound Parse webhook, so a reply to the BYOD address never reaches us. The
+        // tenant's verified subdomain (fromEmail) is the inbound ingest path that threads
+        // replies back into tickets, so point Reply-To there. Do NOT "clean up" this
+        // seemingly-redundant Reply-To — without it, replies to BYOD mail are lost.
+        const byodReplyTo =
+          tenantConfig?.replyTo ||
+          (tenantConfig?.domainVerified && tenantConfig.fromEmail ? tenantConfig.fromEmail : undefined);
+        return {
+          from: `${fromName} <${byod.byodFromEmail}>`,
+          replyTo: byodReplyTo,
+        };
       }
 
       // If tenant has a verified subdomain (skyrack.com), use their configured from address
-      if (tenantConfig.domainVerified && tenantConfig.fromEmail) {
-        const fromName = tenantConfig.fromName || defaultFromName;
+      if (tenantConfig?.domainVerified && tenantConfig.fromEmail) {
         return {
           from: `${fromName} <${tenantConfig.fromEmail}>`,
           replyTo: tenantConfig.replyTo || undefined,
@@ -116,10 +155,15 @@ export class SendGridService {
       }
 
       // Tenant exists but domain not verified - use default from with tenant's replyTo
-      return {
-        from: defaultFrom,
-        replyTo: tenantConfig.replyTo || tenantConfig.fromEmail || undefined,
-      };
+      if (tenantConfig) {
+        return {
+          from: defaultFrom,
+          replyTo: tenantConfig.replyTo || tenantConfig.fromEmail || undefined,
+        };
+      }
+
+      // No tenant config at all
+      return { from: defaultFrom };
     } catch (error) {
       console.error('Error fetching tenant email config:', error);
       return { from: defaultFrom };
@@ -128,7 +172,7 @@ export class SendGridService {
 
   async sendEmail(options: SendEmailOptions): Promise<SendEmailResult> {
     // Get tenant-specific email configuration, passing requested from for BYOD domain check
-    const tenantConfig = await this.getTenantEmailConfig(options.tenantId, options.from);
+    const tenantConfig = await this.getTenantEmailConfig(options.tenantId, options.from, options.fromPrefix);
 
     // getTenantEmailConfig resolves BYOD domains, subdomain config, and defaults
     const from = tenantConfig.from;

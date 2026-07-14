@@ -35,10 +35,14 @@ router.post('/send', async (req: Request, res: Response) => {
   try {
     const prisma: PrismaClient = req.app.locals.prisma;
     const templateService = new TemplateService(prisma);
-    const { to, template, data, tenantId, from, replyTo, html, text, subject, headers, cc, bcc, tags, metadata, attachments } = req.body;
+    const { to, template, data, tenantId, from, fromPrefix, replyTo, html, text, subject, headers, cc, bcc, tags, metadata, attachments } = req.body;
 
     if (!to) {
       return res.status(400).json({ error: 'Missing required field: to' });
+    }
+
+    if (from && fromPrefix) {
+      return res.status(400).json({ error: 'Provide either from or fromPrefix, not both' });
     }
 
     // Debug: log attachment data for ticket-comment emails (both paths)
@@ -57,12 +61,13 @@ router.post('/send', async (req: Request, res: Response) => {
         data || {}
       );
 
-      // Create EmailLog record so raw sends appear in stats/logs
-      const resolvedFrom = from || process.env.EMAIL_FROM || 'noreply@skyrack.com';
+      // Create EmailLog record so raw sends appear in stats/logs. sendEmail resolves the
+      // real sender internally, so record a placeholder here and backfill on success.
+      const requestedFrom = from;
       const log = await prisma.emailLog.create({
         data: {
           to: Array.isArray(to) ? to.join(', ') : to,
-          from: resolvedFrom,
+          from: requestedFrom || 'pending-resolution',
           subject,
           template: template || 'raw-html',
           status: 'sending',
@@ -78,6 +83,7 @@ router.post('/send', async (req: Request, res: Response) => {
         html: withAttachments.html,
         text: withAttachments.text,
         from,
+        fromPrefix,
         replyTo,
         tenantId,
         tags: tags ? Object.entries(tags).map(([name, value]) => ({ name, value: String(value) })) : undefined,
@@ -97,6 +103,7 @@ router.post('/send', async (req: Request, res: Response) => {
         where: { id: log.id },
         data: {
           status: 'sent',
+          from: result.from || requestedFrom || 'unknown',
           sendgridMessageId: result.messageId,
           sentAt: new Date(),
         },
@@ -131,6 +138,7 @@ router.post('/send', async (req: Request, res: Response) => {
       data: data || {},
       tenantId,
       from,
+      fromPrefix,
       replyTo,
     });
 

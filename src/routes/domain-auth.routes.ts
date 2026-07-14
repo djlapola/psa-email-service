@@ -21,13 +21,47 @@ const authenticate = (req: Request, res: Response, next: NextFunction) => {
 router.use(authenticate);
 
 /**
+ * Validate an optional byodFromEmail against its domain.
+ * Three success shapes (mutually exclusive), plus an error shape:
+ *   - {}                -> field absent: caller must NOT touch the column
+ *   - { setNull: true } -> field present but empty/whitespace: caller must store NULL
+ *                          (an untouched HTML form input submits ''; treat as "clear it")
+ *   - { value: string } -> a validated, trimmed address to store
+ *   - { error: string } -> validation failure (caller returns 400)
+ * NB: storing '' instead of NULL would defeat the resolver's `byodFromEmail: { not: null }`
+ * filter and yield a `Name <>` From header, so empty MUST coerce to NULL.
+ */
+function validateByodFromEmail(
+  value: unknown,
+  domain: string
+): { value?: string; error?: string; setNull?: boolean } {
+  if (value === undefined || value === null) {
+    return {};
+  }
+  if (typeof value !== 'string') {
+    return { error: 'byodFromEmail must be a string' };
+  }
+  const trimmed = value.trim();
+  if (trimmed === '') {
+    return { setNull: true };
+  }
+  if (/[\r\n<>]/.test(trimmed)) {
+    return { error: 'byodFromEmail contains invalid characters' };
+  }
+  if (!trimmed.toLowerCase().endsWith(`@${domain.toLowerCase()}`)) {
+    return { error: 'byodFromEmail must be an address on this domain' };
+  }
+  return { value: trimmed };
+}
+
+/**
  * POST /api/domains/authenticate
  * Start domain authentication for a tenant's custom (BYOD) domain
  */
 router.post('/authenticate', async (req: Request, res: Response) => {
   try {
     const prisma: PrismaClient = req.app.locals.prisma;
-    const { tenantId, domain } = req.body;
+    const { tenantId, domain, byodFromEmail } = req.body;
 
     if (!tenantId || !domain) {
       return res.status(400).json({ error: 'tenantId and domain are required' });
@@ -36,6 +70,12 @@ router.post('/authenticate', async (req: Request, res: Response) => {
     // Validate domain format (basic check)
     if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(domain.toLowerCase())) {
       return res.status(400).json({ error: 'Invalid domain format' });
+    }
+
+    // Optional BYOD from address must be an address on this domain
+    const byodResult = validateByodFromEmail(byodFromEmail, domain);
+    if (byodResult.error) {
+      return res.status(400).json({ error: byodResult.error });
     }
 
     // Check if domain already exists for this tenant
@@ -65,13 +105,14 @@ router.post('/authenticate', async (req: Request, res: Response) => {
     const sendgridDomainId = String(sgDomain.id);
 
     // Extract DNS records into a human-readable format
-    const dnsRecords: Array<{ type: string; host: string; value: string; valid: boolean }> = [];
+    const dnsRecords: Array<{ key: string; type: string; host: string; value: string; valid: boolean }> = [];
     const dns = sgDomain.dns || {};
 
     for (const key of Object.keys(dns)) {
       const record = dns[key];
       if (record.host && record.data) {
         dnsRecords.push({
+          key,
           type: (record.type || 'cname').toUpperCase(),
           host: record.host,
           value: record.data,
@@ -81,6 +122,10 @@ router.post('/authenticate', async (req: Request, res: Response) => {
     }
 
     // Upsert the domain record
+    // setNull -> store NULL; a validated value -> store it; absent -> undefined
+    // (Prisma leaves the column untouched on update / defaults to NULL on create).
+    const byodFromEmailToStore = byodResult.setNull ? null : byodResult.value;
+
     await prisma.tenantEmailDomain.upsert({
       where: { tenantId_domain: { tenantId, domain: domain.toLowerCase() } },
       create: {
@@ -89,12 +134,14 @@ router.post('/authenticate', async (req: Request, res: Response) => {
         status: 'pending',
         sendgridDomainId,
         dnsRecords,
+        byodFromEmail: byodFromEmailToStore,
       },
       update: {
         status: 'pending',
         sendgridDomainId,
         dnsRecords,
         verifiedAt: null,
+        byodFromEmail: byodFromEmailToStore,
       },
     });
 
@@ -152,17 +199,20 @@ router.post('/verify', async (req: Request, res: Response) => {
     const isValid = validation.valid === true;
 
     // Build per-record results from validation_results
-    const recordResults: Array<{ type: string; host: string; valid: boolean; reason?: string }> = [];
+    const recordResults: Array<{ key: string; type: string; host: string; valid: boolean; reason?: string }> = [];
     const validationResults = validation.validation_results || {};
+    const resultByKey: Record<string, { valid: boolean; reason?: string }> = {};
 
     for (const key of Object.keys(validationResults)) {
       const result = validationResults[key];
       recordResults.push({
+        key,
         type: key,
         host: result.host || key,
         valid: result.valid === true,
         reason: result.reason || undefined,
       });
+      resultByKey[key] = { valid: result.valid === true, reason: result.reason || undefined };
     }
 
     // Update the domain record
@@ -179,13 +229,15 @@ router.post('/verify', async (req: Request, res: Response) => {
     // Update DNS records with current validity
     if (domainRecord.dnsRecords && Array.isArray(domainRecord.dnsRecords)) {
       const updatedRecords = (domainRecord.dnsRecords as any[]).map(record => {
-        const matchingResult = recordResults.find(r =>
-          r.host === record.host || r.type.toLowerCase().includes(record.host.split('.')[0])
-        );
-        return {
-          ...record,
-          valid: matchingResult?.valid ?? record.valid,
-        };
+        if (record.key) {
+          // New rows: direct key lookup against validation_results.
+          const result = resultByKey[record.key];
+          return { ...record, valid: result ? result.valid === true : record.valid };
+        }
+        // Backward compatibility: rows created before `key` was stored.
+        // Fall back to an exact host match only; leave valid untouched otherwise.
+        const matchingResult = recordResults.find(r => r.host === record.host);
+        return { ...record, valid: matchingResult ? matchingResult.valid === true : record.valid };
       });
       updateData.dnsRecords = updatedRecords;
     }
@@ -235,6 +287,8 @@ router.get('/:tenantId', async (req: Request, res: Response) => {
         domain: d.domain,
         status: d.status,
         dnsRecords: d.dnsRecords,
+        byodFromEmail: d.byodFromEmail,
+        isDefault: d.isDefault,
         verifiedAt: d.verifiedAt,
         lastVerifiedAt: d.lastVerifiedAt,
         createdAt: d.createdAt,
@@ -272,6 +326,75 @@ router.get('/:tenantId/:domain/dns-records', async (req: Request, res: Response)
     });
   } catch (error: any) {
     console.error('[DomainAuth] DNS records error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * PATCH /api/domains/:tenantId/:domain
+ * Update BYOD sending config for a custom domain (from address and/or default flag)
+ */
+router.patch('/:tenantId/:domain', async (req: Request, res: Response) => {
+  try {
+    const prisma: PrismaClient = req.app.locals.prisma;
+    const { tenantId, domain } = req.params;
+    const { byodFromEmail, isDefault } = req.body;
+
+    const domainRecord = await prisma.tenantEmailDomain.findUnique({
+      where: { tenantId_domain: { tenantId, domain: domain.toLowerCase() } },
+    });
+
+    if (!domainRecord) {
+      return res.status(404).json({ error: 'Domain not found' });
+    }
+
+    const updateData: any = {};
+
+    if (byodFromEmail !== undefined) {
+      const byodResult = validateByodFromEmail(byodFromEmail, domainRecord.domain);
+      if (byodResult.error) {
+        return res.status(400).json({ error: byodResult.error });
+      }
+      // An empty/whitespace value clears the column (NULL), never stores ''.
+      updateData.byodFromEmail = byodResult.setNull ? null : byodResult.value;
+    }
+
+    if (isDefault !== undefined) {
+      updateData.isDefault = isDefault === true;
+    }
+
+    let updated;
+    if (isDefault === true) {
+      // Ensure only this row is the default for the tenant
+      [, updated] = await prisma.$transaction([
+        prisma.tenantEmailDomain.updateMany({
+          where: { tenantId, id: { not: domainRecord.id } },
+          data: { isDefault: false },
+        }),
+        prisma.tenantEmailDomain.update({
+          where: { id: domainRecord.id },
+          data: updateData,
+        }),
+      ]);
+    } else {
+      updated = await prisma.tenantEmailDomain.update({
+        where: { id: domainRecord.id },
+        data: updateData,
+      });
+    }
+
+    res.json({
+      id: updated.id,
+      domain: updated.domain,
+      status: updated.status,
+      byodFromEmail: updated.byodFromEmail,
+      isDefault: updated.isDefault,
+      verifiedAt: updated.verifiedAt,
+      lastVerifiedAt: updated.lastVerifiedAt,
+      createdAt: updated.createdAt,
+    });
+  } catch (error: any) {
+    console.error('[DomainAuth] Patch error:', error);
     res.status(500).json({ error: error.message });
   }
 });

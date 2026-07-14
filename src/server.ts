@@ -7,6 +7,7 @@ import emailRoutes from './routes/email.routes';
 import domainAuthRoutes from './routes/domain-auth.routes';
 import domainRoutes from './routes/domain.routes';
 import inboundRoutes from './routes/inbound.routes';
+import configRoutes from './routes/config.routes';
 import { QueueService } from './services/queue.service';
 import { createDomainService } from './services/domain.service';
 import { createWebhookService } from './services/webhook.service';
@@ -27,7 +28,24 @@ const domainHealthService = createDomainHealthService(
   createDomainService(prisma),
   createWebhookService(prisma),
 );
-const DOMAIN_HEALTH_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6h
+let sweepInProgress = false;
+
+// Guarded, fire-and-forget wrapper around the domain-health sweep so boot and
+// the scheduler endpoint share a single in-flight sweep. Caller never awaits
+// the sweep itself (a full sweep is slow: SendGrid /validate per domain).
+async function runSweepGuarded(trigger: string): Promise<{ started: boolean }> {
+  if (sweepInProgress) {
+    console.log(`[DomainHealth] Sweep already in progress — ${trigger} skipped`);
+    return { started: false };
+  }
+  sweepInProgress = true;
+  // fire-and-forget; caller does not await the sweep itself
+  domainHealthService
+    .runDomainHealthSweep()
+    .catch(err => console.error(`[DomainHealth] Sweep (${trigger}) failed:`, err?.message || err))
+    .finally(() => { sweepInProgress = false; });
+  return { started: true };
+}
 
 // Middleware
 app.use(cors());
@@ -67,9 +85,22 @@ app.get('/health', async (req, res) => {
 
 // API routes
 app.use('/api', emailRoutes);
+app.use('/api/config', configRoutes);
 app.use('/api/domains', domainAuthRoutes);  // BYOD custom domain auth (must be before domainRoutes for /authenticate, /verify)
 app.use('/api/domains', domainRoutes);
 app.use('/api/inbound', inboundRoutes);
+
+// Internal: trigger a domain-health sweep (called by Cloud Scheduler).
+// Returns immediately (202) — the sweep runs fire-and-forget in the background.
+app.post('/api/internal/sweep', async (req, res) => {
+  const apiKey = req.headers['x-api-key'] || (req.headers['authorization'] as string | undefined)?.replace('Bearer ', '');
+  if (!apiKey || apiKey !== process.env.EMAIL_SERVICE_API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const { started } = await runSweepGuarded('scheduler');
+  // 202 whether or not we started one (idempotent from the scheduler's view)
+  return res.status(202).json({ started, message: started ? 'Sweep started' : 'Sweep already in progress' });
+});
 
 // Error handling
 app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
@@ -99,6 +130,9 @@ process.on('SIGINT', async () => {
 // because failures are logged and skipped rather than aborting startup.
 const MIGRATION_STATEMENTS: string[] = [
   `ALTER TABLE "tenant_email_configs" ADD COLUMN IF NOT EXISTS "lastHealthAlertAt" TIMESTAMP(3)`,
+  `ALTER TABLE "tenant_email_domains" ADD COLUMN IF NOT EXISTS "byodFromEmail" TEXT`,
+  `ALTER TABLE "tenant_email_domains" ADD COLUMN IF NOT EXISTS "isDefault" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "tenant_email_domains" ADD COLUMN IF NOT EXISTS "lastHealthAlertAt" TIMESTAMP(3)`,
 ];
 
 // Warm the Prisma connection pool before the first migration DDL runs.
@@ -180,6 +214,9 @@ async function runMigrationsIfNeeded() {
 // Start server
 app.listen(port, async () => {
   console.log(`Email service running on port ${port}`);
+  if (!process.env.EMAIL_FROM) {
+    console.error('[Startup] EMAIL_FROM is not configured — platform-rail emails will fall back to psa@skyrack.com');
+  }
   try {
     await waitForDatabase();
     await runMigrationsIfNeeded();
@@ -189,16 +226,9 @@ app.listen(port, async () => {
   await queueService.loadPendingEmails();
   queueService.start();
 
-  // Domain-health sweeps: run once at startup (non-blocking) then every 6h.
-  // Best-effort — a sweep failure is logged and never crashes the service.
-  domainHealthService
-    .runDomainHealthSweep()
-    .catch(err => console.error('[DomainHealth] Initial sweep failed:', err?.message || err));
-  setInterval(() => {
-    domainHealthService
-      .runDomainHealthSweep()
-      .catch(err => console.error('[DomainHealth] Scheduled sweep failed:', err?.message || err));
-  }, DOMAIN_HEALTH_INTERVAL_MS);
+  // Domain-health sweep: run once at startup (non-blocking, best-effort).
+  // Recurring sweeps are now driven by Cloud Scheduler via /api/internal/sweep.
+  runSweepGuarded('boot');
 });
 
 export { app, prisma };

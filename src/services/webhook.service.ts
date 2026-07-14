@@ -28,13 +28,14 @@ export interface DomainHealthEvent {
   tenantId: string;    // PSA tenant id (tenant_email_configs.tenantId)
   subdomain: string;
   domain: string;
-  status: 'unverified' | 'drift';
+  owner: 'skyrack' | 'byod';   // 'skyrack' = {sub}.skyrack.com (we own the DNS in Cloudflare); 'byod' = tenant's own domain at their registrar
+  status: 'unverified' | 'drift' | 'recovered';
   failingRecords: DomainHealthFailingRecord[];
   message: string;
 }
 
 const MAX_WEBHOOK_RETRIES = 3;
-const WEBHOOK_TIMEOUT = 10000; // 10 seconds
+const WEBHOOK_TIMEOUT = 30000; // 30 seconds (CP scales to zero; this webhook is nearly its only traffic, so it reliably hits a cold container)
 
 export class WebhookService {
   private prisma: PrismaClient;
@@ -169,11 +170,11 @@ export class WebhookService {
    * pattern (HMAC-SHA256 signature + X-Email-Service-* headers). Best-effort with the
    * same retry/backoff as email events; never throws.
    */
-  async notifyDomainHealth(event: DomainHealthEvent): Promise<void> {
+  async notifyDomainHealth(event: DomainHealthEvent): Promise<boolean> {
     const url = process.env.CONTROL_PLANE_WEBHOOK_URL;
     if (!url) {
       console.warn('[Webhook] CONTROL_PLANE_WEBHOOK_URL not set; skipping domain.health emit');
-      return;
+      return false;
     }
 
     for (let attempt = 1; attempt <= MAX_WEBHOOK_RETRIES; attempt++) {
@@ -196,12 +197,14 @@ export class WebhookService {
 
         if (response.ok) {
           console.log(`[Webhook] domain.health (${event.status}) delivered to CP for ${event.domain}`);
-          return;
+          return true;
         }
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-        console.error(`[Webhook] domain.health delivery failed (attempt ${attempt}/${MAX_WEBHOOK_RETRIES}) for ${event.domain}: ${errorMessage}`);
+        const isAbort = error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError');
+        const kind = isAbort ? `TIMEOUT after ${WEBHOOK_TIMEOUT}ms` : 'HTTP_ERROR';
+        console.error(`[Webhook] domain.health delivery failed [${kind}] (attempt ${attempt}/${MAX_WEBHOOK_RETRIES}) for ${event.domain}: ${errorMessage}`);
         if (attempt < MAX_WEBHOOK_RETRIES) {
           const delay = Math.pow(2, attempt) * 1000; // Exponential backoff
           await new Promise(r => setTimeout(r, delay));
@@ -210,6 +213,7 @@ export class WebhookService {
         }
       }
     }
+    return false;
   }
 
   /**

@@ -103,6 +103,11 @@ model TenantEmailDomain {
   lastVerifiedAt    DateTime?
   verifiedAt        DateTime?
 
+  // BYOD sending config
+  byodFromEmail     String?
+  isDefault         Boolean   @default(false)
+  lastHealthAlertAt DateTime?
+
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
 
