@@ -145,6 +145,15 @@ app.post('/api/internal/tenant/:tenantId/purge', async (req, res) => {
     // a SendGrid failure is warned (logging the orphaned id for manual cleanup) and skipped —
     // SendGrid being down must not block deleting the tenant's data. Matches the manual-delete
     // handler pattern in domain-auth.routes.ts.
+    // Collect external-cleanup failures (in addition to the per-point warns) so the response
+    // hands CP the exact ids/domains that need manual cleanup. This does NOT change behavior:
+    // cleanup stays best-effort and the endpoint still returns 200 unless the DB transaction fails.
+    const failures: {
+      sendgridDomainIds: string[];    // whitelabel domain ids that failed to de-auth (BYOD + subdomain)
+      inboundParseDomains: string[];  // domains whose inbound-parse removal failed
+      cloudflareRecordIds: string[];  // Cloudflare record ids that failed to delete
+    } = { sendgridDomainIds: [], inboundParseDomains: [], cloudflareRecordIds: [] };
+
     const domains = await prisma.tenantEmailDomain.findMany({
       where: { tenantId },
       select: { domain: true, sendgridDomainId: true },
@@ -160,6 +169,7 @@ app.post('/api/internal/tenant/:tenantId/purge', async (req, res) => {
         sendgridDeauthed++;
       } catch (e: any) {
         console.warn(`[TenantPurge] Could not de-auth SendGrid domain ${d.domain} (${d.sendgridDomainId}): ${e.message}`);
+        failures.sendgridDomainIds.push(d.sendgridDomainId);
       }
     }
 
@@ -187,6 +197,7 @@ app.post('/api/internal/tenant/:tenantId/purge', async (req, res) => {
           sendgridDeauthed++;
         } catch (e: any) {
           console.warn(`[TenantPurge] Could not de-auth SendGrid subdomain ${config.domain} (${config.sendgridDomainId}): ${e.message}`);
+          failures.sendgridDomainIds.push(config.sendgridDomainId);
         }
       }
       // a. Remove SendGrid inbound-parse setting (only if receiving was enabled).
@@ -199,6 +210,7 @@ app.post('/api/internal/tenant/:tenantId/purge', async (req, res) => {
           inboundParseRemoved++;
         } catch (e: any) {
           console.warn(`[TenantPurge] Could not remove inbound parse for ${config.domain}: ${e.message}`);
+          failures.inboundParseDomains.push(config.domain);
         }
       }
       // b. Remove Cloudflare DNS records by the ids stored at provisioning.
@@ -210,9 +222,13 @@ app.post('/api/internal/tenant/:tenantId/purge', async (req, res) => {
           cloudflareDnsRemoved += ids.length - result.errors.length;
           if (result.errors.length > 0) {
             console.warn(`[TenantPurge] Some Cloudflare DNS records for ${config.domain} (ids: ${ids.join(', ')}) failed to delete: ${result.errors.join('; ')}`);
+            // errors[] gives no clean id-per-error mapping; hand the operator this config's
+            // candidate ids to verify at Cloudflare (over-listing already-deleted ids is harmless).
+            failures.cloudflareRecordIds.push(...ids);
           }
         } catch (e: any) {
           console.warn(`[TenantPurge] Could not remove Cloudflare DNS records for ${config.domain} (ids: ${ids.join(', ')}): ${e.message}`);
+          failures.cloudflareRecordIds.push(...ids);
         }
       }
     }
@@ -236,8 +252,8 @@ app.post('/api/internal/tenant/:tenantId/purge', async (req, res) => {
       emailLog: emailLog.count,
       emailTemplate: emailTemplate.count,
     };
-    console.log(`[TenantPurge] Purged tenant ${tenantId} (sendgridDeauthed=${sendgridDeauthed}, inboundParseRemoved=${inboundParseRemoved}, cloudflareDnsRemoved=${cloudflareDnsRemoved}):`, JSON.stringify(counts));
-    return res.status(200).json({ tenantId, deleted: counts, sendgridDeauthed, inboundParseRemoved, cloudflareDnsRemoved });
+    console.log(`[TenantPurge] Purged tenant ${tenantId} (sendgridDeauthed=${sendgridDeauthed}, inboundParseRemoved=${inboundParseRemoved}, cloudflareDnsRemoved=${cloudflareDnsRemoved}, failures=${JSON.stringify(failures)}):`, JSON.stringify(counts));
+    return res.status(200).json({ tenantId, deleted: counts, sendgridDeauthed, inboundParseRemoved, cloudflareDnsRemoved, failures });
   } catch (error: any) {
     // Do NOT swallow — a non-200 tells CP to abort-and-retry its deletion.
     console.error(`[TenantPurge] Failed to purge tenant ${tenantId}:`, error?.message || error);
