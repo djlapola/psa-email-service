@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import crypto from 'crypto';
+import sgClient from '@sendgrid/client'; // API key set at module load by domain-auth.routes / domain-health.service
 import { PrismaClient } from '@prisma/client';
 import emailRoutes from './routes/email.routes';
 import domainAuthRoutes from './routes/domain-auth.routes';
@@ -12,6 +13,7 @@ import { QueueService } from './services/queue.service';
 import { createDomainService } from './services/domain.service';
 import { createWebhookService } from './services/webhook.service';
 import { createDomainHealthService } from './services/domain-health.service';
+import { cloudflareService } from './services/cloudflare.service';
 
 dotenv.config();
 
@@ -125,8 +127,7 @@ app.post('/api/internal/sweep', async (req, res) => {
 // flow). :tenantId is the PSA tenant id (cuid) — the key on every tenant-scoped model.
 // Idempotent: a tenant with no rows returns all-zero counts + 200. On failure returns
 // non-200 (unswallowed) so CP treats it as abort-and-retry, mirroring the PSA-purge pattern.
-// TODO: this does NOT de-authenticate BYOD whitelabel domains at SendGrid — those remain
-// registered there. SendGrid de-auth is a separate follow-up, not handled here.
+// BYOD whitelabel domains are de-authenticated at SendGrid first (best-effort, per-domain).
 app.post('/api/internal/tenant/:tenantId/purge', async (req, res) => {
   const apiKey = req.headers['x-api-key'] || (req.headers['authorization'] as string | undefined)?.replace('Bearer ', '');
   if (!apiKey || apiKey !== process.env.EMAIL_SERVICE_API_KEY) {
@@ -139,6 +140,83 @@ app.post('/api/internal/tenant/:tenantId/purge', async (req, res) => {
   }
 
   try {
+    // De-authenticate BYOD whitelabel domains at SendGrid BEFORE deleting the DB rows,
+    // so a deleted tenant leaves no lingering authentication behind. Per-domain best-effort:
+    // a SendGrid failure is warned (logging the orphaned id for manual cleanup) and skipped —
+    // SendGrid being down must not block deleting the tenant's data. Matches the manual-delete
+    // handler pattern in domain-auth.routes.ts.
+    const domains = await prisma.tenantEmailDomain.findMany({
+      where: { tenantId },
+      select: { domain: true, sendgridDomainId: true },
+    });
+    let sendgridDeauthed = 0;
+    for (const d of domains) {
+      if (!d.sendgridDomainId) continue; // never authenticated → nothing to de-auth
+      try {
+        await sgClient.request({
+          method: 'DELETE',
+          url: `/v3/whitelabel/domains/${d.sendgridDomainId}`,
+        });
+        sendgridDeauthed++;
+      } catch (e: any) {
+        console.warn(`[TenantPurge] Could not de-auth SendGrid domain ${d.domain} (${d.sendgridDomainId}): ${e.message}`);
+      }
+    }
+
+    // Tear down each subdomain config's external footprint BEFORE deleting the DB rows:
+    // SendGrid inbound-parse setting + Cloudflare DNS records (em/DKIM CNAMEs under the base
+    // domain), using the record ids stored at provisioning. Mirrors deprovisionTenantDomain.
+    // All best-effort: a failure is warned (logging what orphaned) and skipped — an external
+    // outage must not block deleting the tenant's data.
+    const configs = await prisma.tenantEmailConfig.findMany({
+      where: { tenantId },
+      select: { domain: true, receivingEnabled: true, cloudflareDnsRecordIds: true, sendgridDomainId: true },
+    });
+    let inboundParseRemoved = 0;
+    let cloudflareDnsRemoved = 0;
+    for (const config of configs) {
+      // a0. De-auth the SUBDOMAIN SendGrid whitelabel registration (separate from the BYOD
+      //     tenant_email_domains ids handled above). Same best-effort pattern; shares the
+      //     sendgridDeauthed counter so the total covers both subdomain + BYOD.
+      if (config.sendgridDomainId) {
+        try {
+          await sgClient.request({
+            method: 'DELETE',
+            url: `/v3/whitelabel/domains/${config.sendgridDomainId}`,
+          });
+          sendgridDeauthed++;
+        } catch (e: any) {
+          console.warn(`[TenantPurge] Could not de-auth SendGrid subdomain ${config.domain} (${config.sendgridDomainId}): ${e.message}`);
+        }
+      }
+      // a. Remove SendGrid inbound-parse setting (only if receiving was enabled).
+      if (config.receivingEnabled && config.domain) {
+        try {
+          await sgClient.request({
+            method: 'DELETE',
+            url: `/v3/user/webhooks/parse/settings/${config.domain}`,
+          });
+          inboundParseRemoved++;
+        } catch (e: any) {
+          console.warn(`[TenantPurge] Could not remove inbound parse for ${config.domain}: ${e.message}`);
+        }
+      }
+      // b. Remove Cloudflare DNS records by the ids stored at provisioning.
+      if (Array.isArray(config.cloudflareDnsRecordIds) && config.cloudflareDnsRecordIds.length > 0) {
+        const ids = config.cloudflareDnsRecordIds as string[];
+        try {
+          const result = await cloudflareService.removeTenantDnsRecords(ids);
+          // removeTenantDnsRecords is per-record best-effort; count what actually deleted.
+          cloudflareDnsRemoved += ids.length - result.errors.length;
+          if (result.errors.length > 0) {
+            console.warn(`[TenantPurge] Some Cloudflare DNS records for ${config.domain} (ids: ${ids.join(', ')}) failed to delete: ${result.errors.join('; ')}`);
+          }
+        } catch (e: any) {
+          console.warn(`[TenantPurge] Could not remove Cloudflare DNS records for ${config.domain} (ids: ${ids.join(', ')}): ${e.message}`);
+        }
+      }
+    }
+
     // All deletes are scoped by the specific tenantId. This inherently protects the
     // null-tenantId system rows (EmailTemplate system defaults, platform EmailLog rows):
     // null never equals a concrete id, so those rows are never matched. No unfiltered delete.
@@ -158,8 +236,8 @@ app.post('/api/internal/tenant/:tenantId/purge', async (req, res) => {
       emailLog: emailLog.count,
       emailTemplate: emailTemplate.count,
     };
-    console.log(`[TenantPurge] Purged tenant ${tenantId}:`, JSON.stringify(counts));
-    return res.status(200).json({ tenantId, deleted: counts });
+    console.log(`[TenantPurge] Purged tenant ${tenantId} (sendgridDeauthed=${sendgridDeauthed}, inboundParseRemoved=${inboundParseRemoved}, cloudflareDnsRemoved=${cloudflareDnsRemoved}):`, JSON.stringify(counts));
+    return res.status(200).json({ tenantId, deleted: counts, sendgridDeauthed, inboundParseRemoved, cloudflareDnsRemoved });
   } catch (error: any) {
     // Do NOT swallow — a non-200 tells CP to abort-and-retry its deletion.
     console.error(`[TenantPurge] Failed to purge tenant ${tenantId}:`, error?.message || error);
