@@ -121,6 +121,52 @@ app.post('/api/internal/sweep', async (req, res) => {
   return res.status(202).json({ started, message: started ? 'Sweep started' : 'Sweep already in progress' });
 });
 
+// Internal: purge ALL of a tenant's email-service data (called by CP's tenant-delete
+// flow). :tenantId is the PSA tenant id (cuid) — the key on every tenant-scoped model.
+// Idempotent: a tenant with no rows returns all-zero counts + 200. On failure returns
+// non-200 (unswallowed) so CP treats it as abort-and-retry, mirroring the PSA-purge pattern.
+// TODO: this does NOT de-authenticate BYOD whitelabel domains at SendGrid — those remain
+// registered there. SendGrid de-auth is a separate follow-up, not handled here.
+app.post('/api/internal/tenant/:tenantId/purge', async (req, res) => {
+  const apiKey = req.headers['x-api-key'] || (req.headers['authorization'] as string | undefined)?.replace('Bearer ', '');
+  if (!apiKey || apiKey !== process.env.EMAIL_SERVICE_API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const { tenantId } = req.params;
+  if (!tenantId) {
+    return res.status(400).json({ error: 'tenantId is required' });
+  }
+
+  try {
+    // All deletes are scoped by the specific tenantId. This inherently protects the
+    // null-tenantId system rows (EmailTemplate system defaults, platform EmailLog rows):
+    // null never equals a concrete id, so those rows are never matched. No unfiltered delete.
+    const [tenantEmailConfig, tenantEmailDomain, emailMessageId, emailLog, emailTemplate] =
+      await prisma.$transaction([
+        prisma.tenantEmailConfig.deleteMany({ where: { tenantId } }),
+        prisma.tenantEmailDomain.deleteMany({ where: { tenantId } }),
+        prisma.emailMessageId.deleteMany({ where: { tenantId } }),
+        prisma.emailLog.deleteMany({ where: { tenantId } }),
+        prisma.emailTemplate.deleteMany({ where: { tenantId } }),
+      ]);
+
+    const counts = {
+      tenantEmailConfig: tenantEmailConfig.count,
+      tenantEmailDomain: tenantEmailDomain.count,
+      emailMessageId: emailMessageId.count,
+      emailLog: emailLog.count,
+      emailTemplate: emailTemplate.count,
+    };
+    console.log(`[TenantPurge] Purged tenant ${tenantId}:`, JSON.stringify(counts));
+    return res.status(200).json({ tenantId, deleted: counts });
+  } catch (error: any) {
+    // Do NOT swallow — a non-200 tells CP to abort-and-retry its deletion.
+    console.error(`[TenantPurge] Failed to purge tenant ${tenantId}:`, error?.message || error);
+    return res.status(500).json({ error: error?.message || 'Purge failed' });
+  }
+});
+
 // Error handling
 app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
   console.error('Unhandled error:', err);
