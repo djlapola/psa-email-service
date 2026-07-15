@@ -376,6 +376,25 @@ export class DomainHealthService {
   }
 
   /**
+   * Public entry point for the "a BYOD custom domain recovered" notification — the
+   * exact pair Sweep D fires on recovery (CP emit + PSA notify), bundled in one place
+   * so the UI verify path and the sweep path can't drift. Called by the /verify route
+   * on a failed→verified transition. Best-effort: each half logs-and-continues, and the
+   * whole method never throws (the recovery is real locally regardless of emit success).
+   */
+  async emitByodRecovery(tenantId: string, domain: string): Promise<void> {
+    const ok = await this.emit(
+      { tenantId, domain, subdomain: domain, owner: 'byod' },
+      'recovered',
+      [],
+    );
+    if (!ok) {
+      console.warn(`[DomainHealth] BYOD RECOVERED (UI verify): ${domain} (${tenantId}) — but CP emit failed`);
+    }
+    await this.notifyPsaDomainEvent(tenantId, domain, 'recovered');
+  }
+
+  /**
    * Emit a domain.health event to CP via the existing signed webhook emitter.
    * tenantId is the PSA tenant id (tenant_email_configs.tenantId), which CP resolves
    * via `where: { psaTenantId }`.

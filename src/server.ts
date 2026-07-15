@@ -30,6 +30,11 @@ const domainHealthService = createDomainHealthService(
 );
 let sweepInProgress = false;
 
+// Set true once waitForDatabase() confirms the DB is reachable. Before that the
+// container is still warming its connection pool, and a /health DB ping would throw
+// transiently — which must NOT be reported as 'unhealthy' to CP's monitor.
+let dbReady = false;
+
 // Guarded, fire-and-forget wrapper around the domain-health sweep so boot and
 // the scheduler endpoint share a single in-flight sweep. Caller never awaits
 // the sweep itself (a full sweep is slow: SendGrid /validate per domain).
@@ -60,9 +65,23 @@ app.use(express.json());
 // Make prisma and queue available to routes
 app.locals.prisma = prisma;
 app.locals.queueService = queueService;
+app.locals.domainHealthService = domainHealthService;
 
 // Health check (no auth required)
 app.get('/health', async (req, res) => {
+  // Still warming up: the DB pool isn't established yet, so a live ping would throw
+  // transiently. Report 'starting' (200) — expected, not a real failure. Monitors must
+  // not alert on this.
+  if (!dbReady) {
+    return res.status(200).json({
+      status: 'starting',
+      service: 'email-service',
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  // DB was reachable at startup. A failed ping here is a REAL failure (was ready, now
+  // the DB is down) and is correctly alert-worthy.
   try {
     await prisma.$queryRaw`SELECT 1`;
     res.json({
@@ -219,6 +238,8 @@ app.listen(port, async () => {
   }
   try {
     await waitForDatabase();
+    dbReady = true; // DB is reachable now; /health may live-ping. Set before migrations
+                    // so a migration failure (which is tolerated) doesn't hold readiness back.
     await runMigrationsIfNeeded();
   } catch (err: any) {
     console.error('[Migrations] Skipped — DB not ready or migration failed:', err?.message);

@@ -187,6 +187,10 @@ router.post('/verify', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Domain has no SendGrid authentication ID' });
     }
 
+    // Capture BEFORE the update so we can detect a failed→verified recovery below.
+    // Only a domain that had drifted to 'failed' has an open CP alert to resolve.
+    const wasFailed = domainRecord.status === 'failed';
+
     // Call SendGrid validation API
     console.log(`[DomainAuth] Validating domain ${domain} (SendGrid ID: ${domainRecord.sendgridDomainId})`);
 
@@ -248,6 +252,19 @@ router.post('/verify', async (req: Request, res: Response) => {
     });
 
     console.log(`[DomainAuth] Domain ${domain} validation: ${isValid ? 'verified' : 'failed'}`);
+
+    // On a failed→verified recovery driven by the UI (tenant fixed DNS and clicked
+    // Verify instead of waiting for the sweep), fire the same recovery notifications
+    // Sweep D would: resolve CP's open alert + trigger PSA's tenant-admin banner/email.
+    // Best-effort — the recovery is real locally regardless, so a failed emit must not
+    // fail the verify response (same principle as Sweep D persisting status even if emit fails).
+    if (isValid && wasFailed) {
+      try {
+        await req.app.locals.domainHealthService.emitByodRecovery(tenantId, domain.toLowerCase());
+      } catch (emitErr: any) {
+        console.error(`[DomainAuth] BYOD recovery emit failed for ${domain} (${tenantId}):`, emitErr?.message || emitErr);
+      }
+    }
 
     res.json({
       success: true,
