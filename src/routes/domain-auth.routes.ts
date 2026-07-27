@@ -264,6 +264,28 @@ router.post('/verify', async (req: Request, res: Response) => {
       } catch (emitErr: any) {
         console.error(`[DomainAuth] BYOD recovery emit failed for ${domain} (${tenantId}):`, emitErr?.message || emitErr);
       }
+    } else if (!isValid && !wasFailed) {
+      // Verify FAILED on a domain that was NOT already 'failed' (i.e. 'verified' or
+      // 'pending' -> 'failed'): an actual transition. Without this emit the row silently
+      // drops out of Sweep C's `status: 'verified'` population and NO drift alert ever
+      // fires — operator is never told sending fell back to the subdomain. failed->failed
+      // is excluded by `!wasFailed` so hammering Verify can't flood CP.
+      try {
+        const ok = await req.app.locals.domainHealthService.emitDomainStatusChange(
+          { tenantId, domain: domain.toLowerCase(), owner: 'byod' },
+          'failed',
+        );
+        // Gate exactly like Sweep B/C: mark alerted ONLY on a delivered emit, so a failed
+        // webhook doesn't suppress the next sweep's alert for 24h.
+        if (ok) {
+          await prisma.tenantEmailDomain.update({
+            where: { id: domainRecord.id },
+            data: { lastHealthAlertAt: now },
+          });
+        }
+      } catch (emitErr: any) {
+        console.error(`[DomainAuth] BYOD failure emit failed for ${domain} (${tenantId}):`, emitErr?.message || emitErr);
+      }
     }
 
     res.json({

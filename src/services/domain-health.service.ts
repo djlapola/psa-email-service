@@ -395,6 +395,52 @@ export class DomainHealthService {
   }
 
   /**
+   * Public entry point for a UI-driven domain status transition — the CP emit + (BYOD
+   * only) PSA notify pair, bundled here so the /verify routes and the background sweeps
+   * can't drift. Generalizes emitByodRecovery across both rails (skyrack subdomain /
+   * byod custom domain) and both directions:
+   *
+   *   direction 'verified' -> emit 'recovered'  (mirrors Sweep A recovery / Sweep D / emitByodRecovery)
+   *   direction 'failed'   -> emit 'drift'      (mirrors Sweep B / Sweep C)
+   *
+   * Both status strings come straight from the existing `emit` / `notifyPsaDomainEvent`
+   * unions — no new event names. PSA is notified only for owner==='byod' (subdomain DNS
+   * is ours, so there is no tenant admin to email), matching notifyPsaDomainEvent's contract.
+   *
+   * Callers MUST have already confirmed this is a real transition (prior status !== new).
+   * Best-effort: each half logs-and-continues and the method never throws. Returns the CP
+   * emit's success so the caller can gate lastHealthAlertAt on a delivered failure alert
+   * exactly like Sweep B/C (set it only `if (ok)`).
+   */
+  async emitDomainStatusChange(
+    args: { tenantId: string; domain: string; owner: 'skyrack' | 'byod' },
+    direction: 'verified' | 'failed',
+  ): Promise<boolean> {
+    const { tenantId, domain, owner } = args;
+    const emitStatus = direction === 'verified' ? 'recovered' : 'drift';
+
+    const ok = await this.emit(
+      { tenantId, domain, subdomain: domain, owner },
+      emitStatus,
+      [],
+    );
+    if (!ok) {
+      console.warn(`[DomainHealth] ${owner} ${direction} (UI verify): ${domain} (${tenantId}) — but CP emit failed`);
+    }
+
+    // Additive PSA (tenant-admin) notification — BYOD only, same trigger as the CP emit.
+    if (owner === 'byod') {
+      await this.notifyPsaDomainEvent(
+        tenantId,
+        domain,
+        direction === 'verified' ? 'recovered' : 'failed',
+      );
+    }
+
+    return ok;
+  }
+
+  /**
    * Emit a domain.health event to CP via the existing signed webhook emitter.
    * tenantId is the PSA tenant id (tenant_email_configs.tenantId), which CP resolves
    * via `where: { psaTenantId }`.

@@ -66,9 +66,45 @@ router.post('/:tenantId/verify', async (req: Request, res: Response) => {
     const prisma: PrismaClient = req.app.locals.prisma;
     const domainService = createDomainService(prisma);
     const { tenantId } = req.params;
+
+    // Capture BEFORE verifyDomain flips domainVerified, so we emit only on an ACTUAL
+    // transition (verified <-> unverified) rather than on every Verify click. verifyDomain
+    // is ALSO called by Sweep A and the post-provision timer, so the emit lives HERE in the
+    // route — never in the service — to avoid double-emitting from those paths.
+    const before = await prisma.tenantEmailConfig.findUnique({ where: { tenantId } });
+    const wasVerified = before?.domainVerified === true;
+
     const result = await domainService.verifyDomain(tenantId);
 
     if (result.success) {
+      const nowVerified = result.status === 'verified';
+      if (before && nowVerified !== wasVerified) {
+        const dhs = req.app.locals.domainHealthService;
+        const domain = before.domain || '';
+        if (nowVerified) {
+          // unverified -> verified: recovery. Best-effort; do NOT touch lastHealthAlertAt
+          // on the recovery direction (matches emitByodRecovery).
+          try {
+            await dhs.emitDomainStatusChange({ tenantId, domain, owner: 'skyrack' }, 'verified');
+          } catch (emitErr: any) {
+            console.error(`Domain recovery emit failed for ${domain} (${tenantId}):`, emitErr?.message || emitErr);
+          }
+        } else {
+          // verified -> unverified: drift. Gate lastHealthAlertAt on a delivered emit only,
+          // so a failed webhook doesn't suppress Sweep A's alert for 24h.
+          try {
+            const ok = await dhs.emitDomainStatusChange({ tenantId, domain, owner: 'skyrack' }, 'failed');
+            if (ok) {
+              await prisma.tenantEmailConfig.update({
+                where: { tenantId },
+                data: { lastHealthAlertAt: new Date() },
+              });
+            }
+          } catch (emitErr: any) {
+            console.error(`Domain failure emit failed for ${domain} (${tenantId}):`, emitErr?.message || emitErr);
+          }
+        }
+      }
       res.json(result);
     } else {
       res.status(500).json(result);
