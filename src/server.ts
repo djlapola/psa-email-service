@@ -168,8 +168,15 @@ app.post('/api/internal/tenant/:tenantId/purge', async (req, res) => {
         });
         sendgridDeauthed++;
       } catch (e: any) {
-        console.warn(`[TenantPurge] Could not de-auth SendGrid domain ${d.domain} (${d.sendgridDomainId}): ${e.message}`);
-        failures.sendgridDomainIds.push(d.sendgridDomainId);
+        // Idempotent: a 404 means the whitelabel is already gone → success, not failure.
+        // e.code is the HTTP status on @sendgrid/client's ResponseError.
+        if (e?.code === 404) {
+          console.log(`[TenantPurge] SendGrid domain ${d.domain} (${d.sendgridDomainId}) already de-authed (404) — treating as done`);
+          sendgridDeauthed++;
+        } else {
+          console.warn(`[TenantPurge] Could not de-auth SendGrid domain ${d.domain} (${d.sendgridDomainId}): ${e.message}`);
+          failures.sendgridDomainIds.push(d.sendgridDomainId);
+        }
       }
     }
 
@@ -196,8 +203,15 @@ app.post('/api/internal/tenant/:tenantId/purge', async (req, res) => {
           });
           sendgridDeauthed++;
         } catch (e: any) {
-          console.warn(`[TenantPurge] Could not de-auth SendGrid subdomain ${config.domain} (${config.sendgridDomainId}): ${e.message}`);
-          failures.sendgridDomainIds.push(config.sendgridDomainId);
+          // Idempotent: a 404 means the whitelabel is already gone → success, not failure.
+          // e.code is the HTTP status on @sendgrid/client's ResponseError.
+          if (e?.code === 404) {
+            console.log(`[TenantPurge] SendGrid subdomain ${config.domain} (${config.sendgridDomainId}) already de-authed (404) — treating as done`);
+            sendgridDeauthed++;
+          } else {
+            console.warn(`[TenantPurge] Could not de-auth SendGrid subdomain ${config.domain} (${config.sendgridDomainId}): ${e.message}`);
+            failures.sendgridDomainIds.push(config.sendgridDomainId);
+          }
         }
       }
       // a. Remove SendGrid inbound-parse setting (only if receiving was enabled).
@@ -209,8 +223,15 @@ app.post('/api/internal/tenant/:tenantId/purge', async (req, res) => {
           });
           inboundParseRemoved++;
         } catch (e: any) {
-          console.warn(`[TenantPurge] Could not remove inbound parse for ${config.domain}: ${e.message}`);
-          failures.inboundParseDomains.push(config.domain);
+          // Idempotent: a 404 means the inbound-parse setting is already removed → success.
+          // e.code is the HTTP status on @sendgrid/client's ResponseError.
+          if (e?.code === 404) {
+            console.log(`[TenantPurge] Inbound parse for ${config.domain} already removed (404) — treating as done`);
+            inboundParseRemoved++;
+          } else {
+            console.warn(`[TenantPurge] Could not remove inbound parse for ${config.domain}: ${e.message}`);
+            failures.inboundParseDomains.push(config.domain);
+          }
         }
       }
       // b. Remove Cloudflare DNS records by the ids stored at provisioning.

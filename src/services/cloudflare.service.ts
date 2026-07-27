@@ -78,19 +78,31 @@ class CloudflareService {
   /**
    * Delete a DNS record by ID
    */
-  async deleteDnsRecord(recordId: string): Promise<{ success: boolean; error?: string }> {
+  async deleteDnsRecord(recordId: string): Promise<{ success: boolean; error?: string; code?: number }> {
     try {
       const response = await axios.delete<CloudflareResponse<{ id: string }>>(
         `${CLOUDFLARE_API_URL}/zones/${this.zoneId}/dns_records/${recordId}`,
         { headers: this.headers }
       );
 
-      return { success: response.data.success };
+      if (response.data.success) {
+        return { success: true };
+      }
+      // Non-throwing failure (HTTP 2xx, success:false) — surface the numeric error code
+      // so callers can classify (e.g. already-absent) on the stable code, not message text.
+      return {
+        success: false,
+        error: response.data.errors?.map((e: { message: string }) => e.message).join(', '),
+        code: response.data.errors?.[0]?.code,
+      };
     } catch (error: any) {
       console.error('Cloudflare DNS delete error:', error.response?.data || error.message);
+      // Surface Cloudflare's numeric error code from the response body (e.g. 81044 =
+      // "record does not exist") so callers match on the code, never the message string.
       return {
         success: false,
         error: error.response?.data?.errors?.[0]?.message || error.message,
+        code: error.response?.data?.errors?.[0]?.code,
       };
     }
   }
@@ -170,9 +182,17 @@ class CloudflareService {
 
     for (const recordId of recordIds) {
       const result = await this.deleteDnsRecord(recordId);
-      if (!result.success) {
-        errors.push(`Failed to delete record ${recordId}: ${result.error}`);
+      if (result.success) continue;
+      // Deletion is idempotent: a record that is already absent is SUCCESS, not a failure.
+      // Cloudflare returns error code 81044 ("Record does not exist") for this. Match on
+      // the numeric code (stable API contract), NOT the English message string. Log at a
+      // low level so the information is retained without implying failure, and leave it out
+      // of errors[] so it counts toward the deleted total.
+      if (result.code === 81044) {
+        console.log(`Cloudflare DNS record ${recordId} already absent (code 81044) — treating as deleted`);
+        continue;
       }
+      errors.push(`Failed to delete record ${recordId}: ${result.error}`);
     }
 
     return {
