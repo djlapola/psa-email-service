@@ -187,6 +187,17 @@ export class SendGridService {
         text: options.text || 'Please view this email in an HTML-compatible email client.',
         replyTo: replyTo,
         headers: options.headers,
+        // Disable SendGrid click + open tracking on all outbound mail. Nothing in this
+        // service consumes 'click'/'open' webhook events, so the data is collected with no
+        // consumer — and it only lands in Skyrack's SendGrid account, never the MSP whose
+        // clients generated it. Worse, click tracking rewrites portal links to an opaque
+        // ct.sendgrid.net redirect, which reads as phishing to security-trained recipients
+        // and link scanners in transactional PSA mail. enableText:false is required so the
+        // rewrite is also suppressed in the plain-text part, not just the HTML.
+        trackingSettings: {
+          clickTracking: { enable: false, enableText: false },
+          openTracking: { enable: false },
+        },
       };
 
       if (options.tags && options.tags.length > 0) {
