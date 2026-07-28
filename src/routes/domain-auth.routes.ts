@@ -481,10 +481,38 @@ router.delete('/:tenantId/:domain', async (req: Request, res: Response) => {
       }
     }
 
-    // Remove from database
-    await prisma.tenantEmailDomain.delete({
-      where: { id: domainRecord.id },
-    });
+    // Remove from database. If this row was the tenant's default, promote one remaining
+    // sibling to default in the SAME transaction, so there is no window where the tenant
+    // has rows but no default (the state getTenantEmailConfig papers over via its
+    // verifiedAt fallback, but which leaves "set as default" UIs showing nothing selected).
+    // Pick the sibling by verifiedAt desc with NULLs last — mirroring the selection query's
+    // implicit fallback (`orderBy verifiedAt desc`), so the promoted row is the one already
+    // winning selection, and never-verified rows (verifiedAt null) are chosen only as a last
+    // resort rather than sorting first. Promote regardless of status: send time filters
+    // status:'verified', so a pending/failed default is never actually selected for sending,
+    // and leaving no default at all is exactly the state this promotion exists to eliminate.
+    if (domainRecord.isDefault) {
+      await prisma.$transaction(async (tx) => {
+        await tx.tenantEmailDomain.delete({ where: { id: domainRecord.id } });
+        // findFirst runs after the delete within the same transaction, so it never returns
+        // the just-deleted row; null here means no siblings remain → nothing to promote.
+        const sibling = await tx.tenantEmailDomain.findFirst({
+          where: { tenantId },
+          orderBy: [{ verifiedAt: { sort: 'desc', nulls: 'last' } }],
+        });
+        if (sibling) {
+          await tx.tenantEmailDomain.update({
+            where: { id: sibling.id },
+            data: { isDefault: true },
+          });
+          console.log(`[DomainAuth] Promoted ${sibling.domain} to default for tenant ${tenantId} after deleting default ${domain}`);
+        }
+      });
+    } else {
+      await prisma.tenantEmailDomain.delete({
+        where: { id: domainRecord.id },
+      });
+    }
 
     console.log(`[DomainAuth] Removed domain ${domain} for tenant ${tenantId}`);
 
