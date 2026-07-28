@@ -139,6 +139,17 @@ app.post('/api/internal/tenant/:tenantId/purge', async (req, res) => {
     return res.status(400).json({ error: 'tenantId is required' });
   }
 
+  // Explicit-confirmation guard against ACCIDENTAL purges (a live tenant was wiped by a
+  // stray shell call once). The API key remains the security boundary; this only prevents
+  // mistakes. Require { confirmPermanentDeletion: true } — exactly boolean true — in the
+  // body, else reject BEFORE any deletion or external cleanup runs.
+  if (req.body?.confirmPermanentDeletion !== true) {
+    console.warn(`[TenantPurge] Rejected purge for tenant ${tenantId}: missing confirmPermanentDeletion:true`);
+    return res.status(400).json({
+      error: 'Permanent deletion must be explicitly confirmed. Resend with { "confirmPermanentDeletion": true } in the request body.',
+    });
+  }
+
   try {
     // De-authenticate BYOD whitelabel domains at SendGrid BEFORE deleting the DB rows,
     // so a deleted tenant leaves no lingering authentication behind. Per-domain best-effort:
