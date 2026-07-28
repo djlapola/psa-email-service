@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient, Prisma } from '@prisma/client';
 import sgClient from '@sendgrid/client';
 
 sgClient.setApiKey(process.env.SENDGRID_API_KEY || '');
@@ -126,24 +126,37 @@ router.post('/authenticate', async (req: Request, res: Response) => {
     // (Prisma leaves the column untouched on update / defaults to NULL on create).
     const byodFromEmailToStore = byodResult.setNull ? null : byodResult.value;
 
-    await prisma.tenantEmailDomain.upsert({
-      where: { tenantId_domain: { tenantId, domain: domain.toLowerCase() } },
-      create: {
-        tenantId,
-        domain: domain.toLowerCase(),
-        status: 'pending',
-        sendgridDomainId,
-        dnsRecords,
-        byodFromEmail: byodFromEmailToStore,
+    // A tenant's FIRST sending domain must become the default so the BYOD selection query
+    // (orderBy isDefault desc) has something to prefer. Count + upsert run in one
+    // Serializable transaction so two concurrent "first domain" adds can't both read zero
+    // rows and both write isDefault=true — the second serializes and retries/aborts.
+    // isDefault is only set on create; the update branch leaves an existing row's flag
+    // untouched (re-authenticating a known domain must not change which one is default).
+    await prisma.$transaction(
+      async (tx) => {
+        const existingCount = await tx.tenantEmailDomain.count({ where: { tenantId } });
+        await tx.tenantEmailDomain.upsert({
+          where: { tenantId_domain: { tenantId, domain: domain.toLowerCase() } },
+          create: {
+            tenantId,
+            domain: domain.toLowerCase(),
+            status: 'pending',
+            sendgridDomainId,
+            dnsRecords,
+            byodFromEmail: byodFromEmailToStore,
+            isDefault: existingCount === 0,
+          },
+          update: {
+            status: 'pending',
+            sendgridDomainId,
+            dnsRecords,
+            verifiedAt: null,
+            byodFromEmail: byodFromEmailToStore,
+          },
+        });
       },
-      update: {
-        status: 'pending',
-        sendgridDomainId,
-        dnsRecords,
-        verifiedAt: null,
-        byodFromEmail: byodFromEmailToStore,
-      },
-    });
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+    );
 
     console.log(`[DomainAuth] Domain ${domain} registered with SendGrid ID ${sendgridDomainId}, ${dnsRecords.length} DNS records returned`);
 
