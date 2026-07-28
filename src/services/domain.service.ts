@@ -42,9 +42,21 @@ class DomainService {
    */
   async provisionTenantDomain(
     tenantId: string,
-    subdomain: string
+    subdomain: string,
+    companyName?: string
   ): Promise<DomainProvisionResult> {
     const fullDomain = `${subdomain}.${this.baseDomain}`;
+
+    // Seed the sender display name from the tenant's real company name when provided
+    // (e.g. "D3R Corp" -> "D3R Corp Support"), matching the CP-derived signature in email
+    // bodies. Fall back to the subdomain derivation only when companyName is absent/blank,
+    // since /provision may be called without it. NOTE: this seeded value is used ONLY on the
+    // create branch below — a re-provision leaves an existing fromName untouched so a tenant's
+    // Sender Display Name edit (same column) is never clobbered.
+    const trimmedCompanyName = typeof companyName === 'string' ? companyName.trim() : '';
+    const seededFromName = trimmedCompanyName
+      ? `${trimmedCompanyName} Support`
+      : `${subdomain.charAt(0).toUpperCase()}${subdomain.slice(1)} Support`;
 
     try {
       console.log(`[DomainService] Provisioning domain ${fullDomain} for tenant ${tenantId}`);
@@ -138,7 +150,7 @@ class DomainService {
           tenantId,
           domain: fullDomain,
           fromEmail: `support@${fullDomain}`,
-          fromName: `${subdomain.charAt(0).toUpperCase()}${subdomain.slice(1)} Support`,
+          fromName: seededFromName,
           sendgridDomainId: sendgridDomainId,
           cloudflareDnsRecordIds: recordIds,
           domainVerified: false,

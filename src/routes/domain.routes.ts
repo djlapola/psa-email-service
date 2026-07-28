@@ -27,7 +27,7 @@ router.post('/provision', async (req: Request, res: Response) => {
   try {
     const prisma: PrismaClient = req.app.locals.prisma;
     const domainService = createDomainService(prisma);
-    const { tenantId, subdomain } = req.body;
+    const { tenantId, subdomain, companyName } = req.body;
 
     if (!tenantId || !subdomain) {
       return res.status(400).json({
@@ -44,7 +44,9 @@ router.post('/provision', async (req: Request, res: Response) => {
       });
     }
 
-    const result = await domainService.provisionTenantDomain(tenantId, subdomain);
+    // companyName is optional; the service seeds the display name from it when present
+    // and falls back to the subdomain derivation otherwise.
+    const result = await domainService.provisionTenantDomain(tenantId, subdomain, companyName);
 
     if (result.success) {
       res.json(result);
