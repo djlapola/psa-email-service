@@ -401,23 +401,29 @@ export class DomainHealthService {
    * byod custom domain) and both directions:
    *
    *   direction 'verified' -> emit 'recovered'  (mirrors Sweep A recovery / Sweep D / emitByodRecovery)
-   *   direction 'failed'   -> emit 'drift'      (mirrors Sweep B / Sweep C)
+   *   direction 'failed', previously verified     -> emit 'drift'       (mirrors Sweep B / Sweep C)
+   *   direction 'failed', never verified          -> emit 'unverified'  (pending -> failed; nothing "drifted")
    *
-   * Both status strings come straight from the existing `emit` / `notifyPsaDomainEvent`
-   * unions — no new event names. PSA is notified only for owner==='byod' (subdomain DNS
-   * is ours, so there is no tenant admin to email), matching notifyPsaDomainEvent's contract.
+   * The failed direction is split on wasPreviouslyVerified because "drift" means records
+   * that WERE valid broke — false for a pending->failed domain that never had authenticated
+   * records. Both status strings still come straight from the existing `emit` union — no new
+   * event names (CP maps BYOD to the same 'domain.byod_drift' either way and resolves it).
+   * PSA is notified only for owner==='byod' (subdomain DNS is ours, so there is no tenant
+   * admin to email), matching notifyPsaDomainEvent's contract.
    *
-   * Callers MUST have already confirmed this is a real transition (prior status !== new).
-   * Best-effort: each half logs-and-continues and the method never throws. Returns the CP
-   * emit's success so the caller can gate lastHealthAlertAt on a delivered failure alert
-   * exactly like Sweep B/C (set it only `if (ok)`).
+   * Callers MUST have already confirmed this is a real transition (prior status !== new) and
+   * pass the prior-verified flag they already hold (no extra DB read). Best-effort: each half
+   * logs-and-continues and the method never throws. Returns the CP emit's success so the
+   * caller can gate lastHealthAlertAt on a delivered failure alert exactly like Sweep B/C.
    */
   async emitDomainStatusChange(
     args: { tenantId: string; domain: string; owner: 'skyrack' | 'byod' },
     direction: 'verified' | 'failed',
+    wasPreviouslyVerified: boolean,
   ): Promise<boolean> {
     const { tenantId, domain, owner } = args;
-    const emitStatus = direction === 'verified' ? 'recovered' : 'drift';
+    const emitStatus: 'unverified' | 'drift' | 'recovered' =
+      direction === 'verified' ? 'recovered' : wasPreviouslyVerified ? 'drift' : 'unverified';
 
     const ok = await this.emit(
       { tenantId, domain, subdomain: domain, owner },
@@ -455,13 +461,30 @@ export class DomainHealthService {
     let message: string;
     if (status === 'recovered') {
       message = `DNS records for ${domain} are valid again.`;
-    } else if (status === 'drift') {
+    } else if (status === 'drift' && failingRecords.length > 0) {
+      // Sweeps B/C: per-record detail available — keep the existing wording verbatim.
       message =
         owner === 'byod'
           ? `DNS drift detected for ${domain}: ${failingRecords.length} authenticated record(s) no longer match SendGrid's expected values. These records must be corrected at the tenant's own DNS provider (not Cloudflare); until they are, mail from this domain may be marked as spam.`
           : `DNS drift detected for ${domain}: ${failingRecords.length} authenticated record(s) no longer match SendGrid's expected values. Outbound email for this tenant is broken until they are recreated.`;
-    } else {
+    } else if (status === 'drift') {
+      // 'drift' with no per-record detail: a UI verify failure on a previously-verified
+      // domain (failingRecords is []). Do NOT claim a record count — it is not known here.
+      message =
+        owner === 'byod'
+          ? `DNS drift detected for ${domain}: previously-valid authenticated DNS records no longer match SendGrid's expected values. These records must be corrected at the tenant's own DNS provider (not Cloudflare); until they are, mail from this domain may be marked as spam.`
+          : `DNS drift detected for ${domain}: previously-valid authenticated DNS records no longer match SendGrid's expected values. Outbound email for this tenant is broken until they are recreated.`;
+    } else if (failingRecords.length > 0) {
+      // Sweep A: a domain flagged after being unverified long enough, with per-record detail.
       message = `Domain ${domain} has been stuck unverified for over 24h with ${failingRecords.length} failing DNS record(s).`;
+    } else {
+      // 'unverified' with no per-record detail: an immediate UI verify failure on a domain
+      // that was never verified (pending -> failed), or a sweep that couldn't reach SendGrid.
+      // Do NOT claim a 24h duration or a record count — neither is known on this path.
+      message =
+        owner === 'byod'
+          ? `Verification did not succeed for ${domain}: the required DNS records are not yet published or do not match SendGrid's expected values. They must be added or corrected at the tenant's own DNS provider (not Cloudflare) before this domain can send mail.`
+          : `Verification did not succeed for ${domain}: the required DNS records are not yet published or do not match SendGrid's expected values.`;
     }
 
     return this.webhookService.notifyDomainHealth({

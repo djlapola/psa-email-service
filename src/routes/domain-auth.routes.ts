@@ -287,6 +287,7 @@ router.post('/verify', async (req: Request, res: Response) => {
         const ok = await req.app.locals.domainHealthService.emitDomainStatusChange(
           { tenantId, domain: domain.toLowerCase(), owner: 'byod' },
           'failed',
+          domainRecord.status === 'verified', // prior status, already loaded above — no re-query
         );
         // Gate exactly like Sweep B/C: mark alerted ONLY on a delivered emit, so a failed
         // webhook doesn't suppress the next sweep's alert for 24h.

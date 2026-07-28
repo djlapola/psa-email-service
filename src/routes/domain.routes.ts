@@ -85,7 +85,7 @@ router.post('/:tenantId/verify', async (req: Request, res: Response) => {
           // unverified -> verified: recovery. Best-effort; do NOT touch lastHealthAlertAt
           // on the recovery direction (matches emitByodRecovery).
           try {
-            await dhs.emitDomainStatusChange({ tenantId, domain, owner: 'skyrack' }, 'verified');
+            await dhs.emitDomainStatusChange({ tenantId, domain, owner: 'skyrack' }, 'verified', wasVerified);
           } catch (emitErr: any) {
             console.error(`Domain recovery emit failed for ${domain} (${tenantId}):`, emitErr?.message || emitErr);
           }
@@ -93,7 +93,7 @@ router.post('/:tenantId/verify', async (req: Request, res: Response) => {
           // verified -> unverified: drift. Gate lastHealthAlertAt on a delivered emit only,
           // so a failed webhook doesn't suppress Sweep A's alert for 24h.
           try {
-            const ok = await dhs.emitDomainStatusChange({ tenantId, domain, owner: 'skyrack' }, 'failed');
+            const ok = await dhs.emitDomainStatusChange({ tenantId, domain, owner: 'skyrack' }, 'failed', wasVerified);
             if (ok) {
               await prisma.tenantEmailConfig.update({
                 where: { tenantId },
