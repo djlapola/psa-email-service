@@ -23,8 +23,12 @@ RUN npm run build
 # Production stage
 FROM node:20-alpine AS production
 
-# Install OpenSSL for Prisma
-RUN apk add --no-cache openssl
+# Install OpenSSL for Prisma.
+# tzdata + icu-data-full are REQUIRED for timezone-aware date formatting: without them,
+# alpine Node silently ignores the { timeZone } option on Intl.DateTimeFormat/toLocaleString
+# (stub ICU + no zoneinfo) and formats in UTC with NO error or warning. Do not remove as
+# "unused" — nothing imports them, but their absence breaks any localized timestamp at runtime.
+RUN apk add --no-cache openssl tzdata icu-data-full
 
 WORKDIR /app
 
