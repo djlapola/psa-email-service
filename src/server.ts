@@ -14,6 +14,7 @@ import { createDomainService } from './services/domain.service';
 import { createWebhookService } from './services/webhook.service';
 import { createDomainHealthService } from './services/domain-health.service';
 import { cloudflareService } from './services/cloudflare.service';
+import { seedSystemTemplates } from './seed/system-templates';
 
 dotenv.config();
 
@@ -415,6 +416,17 @@ app.listen(port, async () => {
     await runMigrationsIfNeeded();
   } catch (err: any) {
     console.error('[Migrations] Skipped — DB not ready or migration failed:', err?.message);
+  }
+
+  // Seed/sync code-defined system email templates (tenantId = null). Idempotent and
+  // best-effort: guarantees a rebuilt or restored DB still has every default template.
+  // Only touches system rows — tenant overrides are left untouched. A failure here is
+  // logged and skipped so it never blocks the queue or the server from coming up.
+  try {
+    const { created, updated } = await seedSystemTemplates(prisma);
+    console.log(`[SeedTemplates] System templates synced (created=${created}, updated=${updated})`);
+  } catch (err: any) {
+    console.error('[SeedTemplates] Failed to seed system templates:', err?.message || err);
   }
   await queueService.loadPendingEmails();
   queueService.start();

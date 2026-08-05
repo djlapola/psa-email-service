@@ -28,3 +28,6 @@ prisma/migrations/**/migration_lock.toml
 
 # Test coverage
 coverage/
+
+# Production data dump used to reseed system templates — must never be committed
+prod-templates.json
