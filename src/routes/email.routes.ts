@@ -520,7 +520,14 @@ function generateSampleData(variables: { name: string; example: string }[]): Rec
   if (!Array.isArray(variables)) return {};
   return variables.reduce(
     (acc, v) => {
-      acc[v.name] = v.example || `{{${v.name}}}`;
+      // Only seed variables that declare a non-empty example. A variable with an empty
+      // example is left absent, so `interpolate` treats it as "off": {{#if}} blocks drop
+      // and plain {{var}} placeholders stay literal (same output as before). This lets a
+      // template declare mutually-exclusive conditional flags (empty example) that render
+      // OFF in preview, instead of every flag's block rendering at once.
+      if (v.example) {
+        acc[v.name] = v.example;
+      }
       return acc;
     },
     {} as Record<string, string>
