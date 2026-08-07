@@ -80,6 +80,12 @@ export class SendGridService {
       return { from: defaultFrom };
     }
 
+    // When a from is requested whose domain is NOT a verified sender for this tenant, we
+    // keep it as the reply-to and fall through to the tenant's own resolution below. It must
+    // override the reply-to that each downstream path would otherwise pick, so replies still
+    // reach the requested mailbox (e.g. an M365 connector).
+    let requestedReplyTo: string | undefined;
+
     try {
       // If a specific from address was requested, check if its domain is a verified BYOD domain
       if (requestedFrom) {
@@ -91,11 +97,12 @@ export class SendGridService {
             // Custom domain is verified — send from the requested address directly
             return { from: requestedFrom };
           }
-          // Custom domain not verified — fall back to default, set requested as replyTo
-          return {
-            from: defaultFrom,
-            replyTo: fromEmail,
-          };
+          // Requested domain is not a verified sender for this tenant. Do NOT fall back to the
+          // platform address here — that would leak Skyrack branding into tenant mail even
+          // though the tenant may have a usable verified sender below. Keep the requested
+          // address as reply-to and fall through to normal resolution (fromPrefix → BYOD →
+          // verified subdomain → default).
+          requestedReplyTo = fromEmail;
         }
       }
 
@@ -117,7 +124,7 @@ export class SendGridService {
         if (sanitized && tenantConfig?.domainVerified && tenantConfig.domain) {
           return {
             from: `${fromName} <${sanitized}@${tenantConfig.domain}>`,
-            replyTo: tenantConfig?.replyTo || undefined,
+            replyTo: requestedReplyTo ?? (tenantConfig?.replyTo || undefined),
           };
         }
         // Otherwise fall through to the normal resolution (do NOT compose against an
@@ -142,7 +149,7 @@ export class SendGridService {
           (tenantConfig?.domainVerified && tenantConfig.fromEmail ? tenantConfig.fromEmail : undefined);
         return {
           from: `${fromName} <${byod.byodFromEmail}>`,
-          replyTo: byodReplyTo,
+          replyTo: requestedReplyTo ?? byodReplyTo,
         };
       }
 
@@ -150,20 +157,29 @@ export class SendGridService {
       if (tenantConfig?.domainVerified && tenantConfig.fromEmail) {
         return {
           from: `${fromName} <${tenantConfig.fromEmail}>`,
-          replyTo: tenantConfig.replyTo || undefined,
+          replyTo: requestedReplyTo ?? (tenantConfig.replyTo || undefined),
         };
       }
 
-      // Tenant exists but domain not verified - use default from with tenant's replyTo
+      // Tenant exists but domain not verified - use default from with tenant's replyTo.
+      // This is the platform-branding fallback: a real tenant's mail is going out as the
+      // Skyrack platform address because it has no usable verified sender. Log it distinctly
+      // so this otherwise-silent state is visible.
       if (tenantConfig) {
+        console.warn(
+          `[getTenantEmailConfig] Tenant ${tenantId} has no verified sender; falling back to platform address "${defaultFrom}". Tenant mail is going out unbranded.`,
+        );
         return {
           from: defaultFrom,
-          replyTo: tenantConfig.replyTo || tenantConfig.fromEmail || undefined,
+          replyTo: requestedReplyTo ?? (tenantConfig.replyTo || tenantConfig.fromEmail || undefined),
         };
       }
 
-      // No tenant config at all
-      return { from: defaultFrom };
+      // No tenant config at all — same unbranded platform fallback for a real tenantId.
+      console.warn(
+        `[getTenantEmailConfig] Tenant ${tenantId} has no email config; falling back to platform address "${defaultFrom}". Tenant mail is going out unbranded.`,
+      );
+      return { from: defaultFrom, replyTo: requestedReplyTo };
     } catch (error) {
       console.error('Error fetching tenant email config:', error);
       return { from: defaultFrom };
