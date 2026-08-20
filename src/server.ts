@@ -15,6 +15,7 @@ import { createWebhookService } from './services/webhook.service';
 import { createDomainHealthService } from './services/domain-health.service';
 import { cloudflareService } from './services/cloudflare.service';
 import { seedSystemTemplates } from './seed/system-templates';
+import { acceptsRotatableKey } from './lib/api-key';
 
 dotenv.config();
 
@@ -116,7 +117,7 @@ app.use('/api/inbound', inboundRoutes);
 // Returns immediately (202) — the sweep runs fire-and-forget in the background.
 app.post('/api/internal/sweep', async (req, res) => {
   const apiKey = req.headers['x-api-key'] || (req.headers['authorization'] as string | undefined)?.replace('Bearer ', '');
-  if (!apiKey || apiKey !== process.env.EMAIL_SERVICE_API_KEY) {
+  if (!acceptsRotatableKey(apiKey, 'EMAIL_SERVICE_API_KEY', 'EMAIL_SERVICE_API_KEY_PREVIOUS', 'EmailServiceAuth')) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   const { started } = await runSweepGuarded('scheduler');
@@ -131,7 +132,7 @@ app.post('/api/internal/sweep', async (req, res) => {
 // BYOD whitelabel domains are de-authenticated at SendGrid first (best-effort, per-domain).
 app.post('/api/internal/tenant/:tenantId/purge', async (req, res) => {
   const apiKey = req.headers['x-api-key'] || (req.headers['authorization'] as string | undefined)?.replace('Bearer ', '');
-  if (!apiKey || apiKey !== process.env.EMAIL_SERVICE_API_KEY) {
+  if (!acceptsRotatableKey(apiKey, 'EMAIL_SERVICE_API_KEY', 'EMAIL_SERVICE_API_KEY_PREVIOUS', 'EmailServiceAuth')) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 

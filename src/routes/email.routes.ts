@@ -4,6 +4,7 @@ import { EventWebhook, EventWebhookHeader } from '@sendgrid/eventwebhook';
 import { QueueService } from '../services/queue.service';
 import { TemplateService, injectAttachmentIndicator } from '../services/template.service';
 import { WebhookService } from '../services/webhook.service';
+import { acceptsRotatableKey } from '../lib/api-key';
 
 const router = Router();
 
@@ -11,7 +12,7 @@ const router = Router();
 const authenticate = (req: Request, res: Response, next: NextFunction) => {
   const apiKey = req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '');
 
-  if (!apiKey || apiKey !== process.env.EMAIL_SERVICE_API_KEY) {
+  if (!acceptsRotatableKey(apiKey, 'EMAIL_SERVICE_API_KEY', 'EMAIL_SERVICE_API_KEY_PREVIOUS', 'EmailServiceAuth')) {
     return res.status(401).json({ error: 'Unauthorized: Invalid API key' });
   }
 
