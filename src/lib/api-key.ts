@@ -73,3 +73,39 @@ export function acceptsRotatableKey(
 
   return false;
 }
+
+/**
+ * Single source of truth for the secrets this service rotates via a `<NAME>_PREVIOUS` counterpart.
+ * Keep additions here and nowhere else — a second, drifting copy is exactly what left CP's rotation
+ * panel showing "unset" during yesterday's rotation.
+ *
+ *  - EMAIL_SERVICE_API_KEY      — VERIFIED here (dual-accepted by acceptsRotatableKey at the four
+ *                                 /api/send + internal-POST guard sites).
+ *  - EMAIL_SERVICE_WEBHOOK_SECRET — the HMAC secret this service SIGNS outbound webhooks with
+ *                                 (webhook.service.ts). Its verifier is CP, but an HMAC rotation
+ *                                 sets `_PREVIOUS` in THIS deployment's env and is just as invisible
+ *                                 to the panel as a plaintext one, so the operator must see it too.
+ *
+ * Deliberately excluded: PSA_INTERNAL_API_KEY (send-only here — PSA verifies and owns its status)
+ * and SENDGRID_WEBHOOK_VERIFICATION_KEY (SendGrid's ECDSA mechanism, not a `_PREVIOUS` rotation).
+ */
+export const ROTATABLE_KEY_BASE_NAMES = [
+  'EMAIL_SERVICE_API_KEY',
+  'EMAIL_SERVICE_WEBHOOK_SECRET',
+] as const;
+
+/**
+ * name→boolean map of each rotatable key's `_PREVIOUS` env var: true iff set to a non-blank,
+ * not-whitespace-only value. Matches how the verifiers themselves treat `_PREVIOUS` (see the
+ * `previous.trim().length > 0` guard in acceptsRotatableKey), so the panel and the verifier agree
+ * on what "set" means. Never returns a secret value — names and booleans only.
+ */
+export function previousKeyStatus(): Record<string, boolean> {
+  const status: Record<string, boolean> = {};
+  for (const base of ROTATABLE_KEY_BASE_NAMES) {
+    const previousName = `${base}_PREVIOUS`;
+    const value = process.env[previousName];
+    status[previousName] = !!value && value.trim().length > 0;
+  }
+  return status;
+}

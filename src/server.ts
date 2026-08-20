@@ -15,7 +15,7 @@ import { createWebhookService } from './services/webhook.service';
 import { createDomainHealthService } from './services/domain-health.service';
 import { cloudflareService } from './services/cloudflare.service';
 import { seedSystemTemplates } from './seed/system-templates';
-import { acceptsRotatableKey } from './lib/api-key';
+import { acceptsRotatableKey, previousKeyStatus } from './lib/api-key';
 
 dotenv.config();
 
@@ -123,6 +123,21 @@ app.post('/api/internal/sweep', async (req, res) => {
   const { started } = await runSweepGuarded('scheduler');
   // 202 whether or not we started one (idempotent from the scheduler's view)
   return res.status(202).json({ started, message: started ? 'Sweep started' : 'Sweep already in progress' });
+});
+
+// Internal: report which rotation `*_PREVIOUS` secrets are currently set on THIS service, so CP's
+// rotation panel isn't blind to it (it reads only its own process.env). Returns the same shape as
+// PSA's GET /api/internal/v1/rotation-status — { service, previous: { <NAME>_PREVIOUS: boolean } } —
+// names and booleans only, never a value. Guarded with the same inline x-api-key check the sibling
+// internal POSTs use (duplicated intentionally — see note in the reported summary), so the panel
+// authenticates exactly as it does to sweep/purge. Path omits PSA's `v1` segment to stay consistent
+// with this service's own unversioned /api/internal/* endpoints.
+app.get('/api/internal/rotation-status', (req, res) => {
+  const apiKey = req.headers['x-api-key'] || (req.headers['authorization'] as string | undefined)?.replace('Bearer ', '');
+  if (!acceptsRotatableKey(apiKey, 'EMAIL_SERVICE_API_KEY', 'EMAIL_SERVICE_API_KEY_PREVIOUS', 'EmailServiceAuth')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  return res.json({ service: 'email-service', previous: previousKeyStatus() });
 });
 
 // Internal: purge ALL of a tenant's email-service data (called by CP's tenant-delete
