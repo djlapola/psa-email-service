@@ -34,6 +34,25 @@ export interface DomainHealthEvent {
   message: string;
 }
 
+/**
+ * Emitted to Control Plane when a webhook delivery to a target (CP or PSA) exhausts all
+ * MAX_WEBHOOK_RETRIES and is permanently marked status='failed'. Without this, a dead
+ * target silently accumulates 'failed' rows and nobody is told — exactly how a month-long
+ * PSA outage (every bounce webhook rejected `400 events array is required`) went unnoticed.
+ *
+ * Carries precisely what CP's AlertsService.createWebhookFailureAlert(webhookUrl, error,
+ * eventType, tenantInfo?) needs to raise a `webhook_failed` operator alert. CP resolves the
+ * tenant by psaTenantId (same as domain.health), so `tenantId` (when known) MUST be the PSA
+ * tenant id carried on the original EmailEvent.
+ */
+export interface WebhookFailureEvent {
+  type: 'webhook.delivery_failed';
+  targetUrl: string;   // the unreachable webhook target        (→ createWebhookFailureAlert webhookUrl)
+  eventType: string;   // the email event that failed to deliver (→ createWebhookFailureAlert eventType), e.g. 'email.bounced'
+  error: string;       // last error recorded on the delivery   (→ createWebhookFailureAlert error)
+  tenantId?: string;   // PSA tenant id, if the failed event carried one (CP resolves tenantInfo from this)
+}
+
 const MAX_WEBHOOK_RETRIES = 3;
 const WEBHOOK_TIMEOUT = 30000; // 30 seconds (CP scales to zero; this webhook is nearly its only traffic, so it reliably hits a cold container)
 
@@ -161,6 +180,22 @@ export class WebhookService {
           data: { status: 'failed' },
         });
         console.error(`Webhook permanently failed for ${url}: ${event.event}`);
+
+        // Tell Control Plane a delivery is permanently dead so it doesn't hide the way the
+        // PSA bounce-webhook outage did. Fire-and-forget and fully isolated: notifyWebhookFailure
+        // catches internally and never rejects; the trailing .catch() is belt-and-suspenders so a
+        // failure to REPORT a failure only logs — it can never cascade back into the delivery path
+        // or block notifyEmailEvent's send loop while a dead target burns through its own retries.
+        void this.notifyWebhookFailure({
+          type: 'webhook.delivery_failed',
+          targetUrl: url,
+          eventType: event.event,
+          error: errorMessage,
+          tenantId: event.tenantId,
+        }).catch((emitErr) => {
+          const m = emitErr instanceof Error ? emitErr.message : String(emitErr);
+          console.error(`[Webhook] Failed to report permanent webhook failure for ${url}: ${m}`);
+        });
       }
     }
   }
@@ -217,9 +252,67 @@ export class WebhookService {
   }
 
   /**
+   * Report a permanently-failed webhook delivery to Control Plane. Deliberate mirror of
+   * notifyDomainHealth: same signed-POST channel (CONTROL_PLANE_WEBHOOK_URL), same HMAC-SHA256
+   * signature + X-Email-Service-* headers, same MAX_WEBHOOK_RETRIES / exponential backoff /
+   * timeout, same best-effort contract (never throws; returns whether CP acknowledged).
+   *
+   * Intentionally does NOT dedupe here. The mirrored domain.health emitter emits every sweep and
+   * lets CP collapse duplicates, and this emitter is a stateless sensor with no view of what alerts
+   * already exist in CP (and its in-memory state would be lost on restart / uncoordinated across
+   * instances anyway). Dedup belongs on the CP receiver, exactly like the domain.health handler,
+   * which skips when an unresolved same-type alert already exists before calling createAlert.
+   */
+  async notifyWebhookFailure(event: WebhookFailureEvent): Promise<boolean> {
+    const url = process.env.CONTROL_PLANE_WEBHOOK_URL;
+    if (!url) {
+      console.warn('[Webhook] CONTROL_PLANE_WEBHOOK_URL not set; skipping webhook-failure emit');
+      return false;
+    }
+
+    for (let attempt = 1; attempt <= MAX_WEBHOOK_RETRIES; attempt++) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), WEBHOOK_TIMEOUT);
+
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Email-Service-Event': event.type,
+            'X-Email-Service-Signature': this.generateSignature(event),
+          },
+          body: JSON.stringify(event),
+          signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
+
+        if (response.ok) {
+          console.log(`[Webhook] webhook-failure (${event.eventType} → ${event.targetUrl}) reported to CP`);
+          return true;
+        }
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        const isAbort = error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError');
+        const kind = isAbort ? `TIMEOUT after ${WEBHOOK_TIMEOUT}ms` : 'HTTP_ERROR';
+        console.error(`[Webhook] webhook-failure report failed [${kind}] (attempt ${attempt}/${MAX_WEBHOOK_RETRIES}) to CP for ${event.targetUrl}: ${errorMessage}`);
+        if (attempt < MAX_WEBHOOK_RETRIES) {
+          const delay = Math.pow(2, attempt) * 1000; // Exponential backoff
+          await new Promise(r => setTimeout(r, delay));
+        } else {
+          console.error(`[Webhook] webhook-failure report permanently failed for target ${event.targetUrl}`);
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
    * Generate a simple signature for webhook verification
    */
-  private generateSignature(event: EmailEvent | DomainHealthEvent): string {
+  private generateSignature(event: EmailEvent | DomainHealthEvent | WebhookFailureEvent): string {
     const crypto = require('crypto');
     const secret = process.env.EMAIL_SERVICE_WEBHOOK_SECRET || 'default-secret';
     return crypto
