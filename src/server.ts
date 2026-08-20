@@ -147,7 +147,13 @@ app.get('/api/internal/rotation-status', (req, res) => {
 // BYOD whitelabel domains are de-authenticated at SendGrid first (best-effort, per-domain).
 app.post('/api/internal/tenant/:tenantId/purge', async (req, res) => {
   const apiKey = req.headers['x-api-key'] || (req.headers['authorization'] as string | undefined)?.replace('Bearer ', '');
-  if (!acceptsRotatableKey(apiKey, 'EMAIL_SERVICE_API_KEY', 'EMAIL_SERVICE_API_KEY_PREVIOUS', 'EmailServiceAuth')) {
+  // Blast-radius, not URL prefix: purge DESTROYS data, so it sits behind its own admin key while the
+  // sibling /api/internal/* endpoints (hourly sweep, read-only rotation-status) stay on the send key.
+  // Keeping the admin key out of the Cloud Scheduler sweep config is the whole point — that spread is
+  // what made the shared internal-api-key painful to rotate. Falls back to EMAIL_SERVICE_API_KEY (and
+  // its _PREVIOUS) until EMAIL_SERVICE_ADMIN_KEY is mounted, so the split deploys as a genuine no-op.
+  const adminKeyName = process.env.EMAIL_SERVICE_ADMIN_KEY?.trim() ? 'EMAIL_SERVICE_ADMIN_KEY' : 'EMAIL_SERVICE_API_KEY';
+  if (!acceptsRotatableKey(apiKey, adminKeyName, `${adminKeyName}_PREVIOUS`, 'EmailServiceAdmin')) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 

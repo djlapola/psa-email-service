@@ -81,6 +81,10 @@ export function acceptsRotatableKey(
  *
  *  - EMAIL_SERVICE_API_KEY      — VERIFIED here (dual-accepted by acceptsRotatableKey at the four
  *                                 /api/send + internal-POST guard sites).
+ *  - EMAIL_SERVICE_ADMIN_KEY    — VERIFIED here, guards ONLY the destructive tenant-purge endpoint
+ *                                 (separated by blast radius). Falls back to EMAIL_SERVICE_API_KEY
+ *                                 at the call site until this secret is mounted, but its rotation is
+ *                                 tracked here regardless so the panel sees it the moment it exists.
  *  - EMAIL_SERVICE_WEBHOOK_SECRET — the HMAC secret this service SIGNS outbound webhooks with
  *                                 (webhook.service.ts). Its verifier is CP, but an HMAC rotation
  *                                 sets `_PREVIOUS` in THIS deployment's env and is just as invisible
@@ -91,6 +95,7 @@ export function acceptsRotatableKey(
  */
 export const ROTATABLE_KEY_BASE_NAMES = [
   'EMAIL_SERVICE_API_KEY',
+  'EMAIL_SERVICE_ADMIN_KEY',
   'EMAIL_SERVICE_WEBHOOK_SECRET',
 ] as const;
 
