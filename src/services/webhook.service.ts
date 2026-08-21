@@ -1,4 +1,5 @@
 import { PrismaClient } from '@prisma/client';
+import { PSA_API_KEY_HEADER, psaApiKey } from '../lib/psa-auth';
 
 export interface EmailEvent {
   event: 'email.delivered' | 'email.bounced' | 'email.complained' | 'email.failed';
@@ -129,9 +130,13 @@ export class WebhookService {
         'X-Email-Service-Signature': this.generateSignature(event),
       };
 
-      // Include auth header for PSA-bound webhooks
-      if (isPsa && process.env.PSA_INTERNAL_API_KEY) {
-        headers['X-Internal-API-Key'] = process.env.PSA_INTERNAL_API_KEY;
+      // Include auth header for PSA-bound webhooks. Uses email-service's own PSA lane
+      // (x-email-service-api-key) via the shared resolver, falling back to the pre-split key.
+      if (isPsa) {
+        const psaKey = psaApiKey();
+        if (psaKey) {
+          headers[PSA_API_KEY_HEADER] = psaKey;
+        }
       }
 
       const response = await fetch(url, {

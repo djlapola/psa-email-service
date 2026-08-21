@@ -89,14 +89,19 @@ export function acceptsRotatableKey(
  *                                 (webhook.service.ts). Its verifier is CP, but an HMAC rotation
  *                                 sets `_PREVIOUS` in THIS deployment's env and is just as invisible
  *                                 to the panel as a plaintext one, so the operator must see it too.
+ *  - EMAIL_SERVICE_TO_PSA_API_KEY — the key this service PRESENTS to PSA (x-email-service-api-key,
+ *                                 psa-auth.ts). PSA is the verifier that dual-accepts it, so the
+ *                                 consuming `_PREVIOUS` lives on PSA — but rotating it touches THIS
+ *                                 deployment's env, so it's tracked here for the same visibility.
  *
- * Deliberately excluded: PSA_INTERNAL_API_KEY (send-only here — PSA verifies and owns its status)
+ * Deliberately excluded: PSA_INTERNAL_API_KEY (the pre-split fallback value — PSA owns its status)
  * and SENDGRID_WEBHOOK_VERIFICATION_KEY (SendGrid's ECDSA mechanism, not a `_PREVIOUS` rotation).
  */
 export const ROTATABLE_KEY_BASE_NAMES = [
   'EMAIL_SERVICE_API_KEY',
   'EMAIL_SERVICE_ADMIN_KEY',
   'EMAIL_SERVICE_WEBHOOK_SECRET',
+  'EMAIL_SERVICE_TO_PSA_API_KEY',
 ] as const;
 
 /**

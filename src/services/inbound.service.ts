@@ -1,7 +1,7 @@
 import { PrismaClient } from '@prisma/client';
+import { PSA_API_KEY_HEADER, psaApiKey } from '../lib/psa-auth';
 
 const PSA_INTERNAL_API_URL = process.env.PSA_INTERNAL_API_URL || 'http://192.168.86.61:3000/api/internal/v1';
-const PSA_INTERNAL_API_KEY = process.env.PSA_INTERNAL_API_KEY || '';
 
 interface InboundEmail {
   from: string;
@@ -227,7 +227,7 @@ class InboundService {
         method: 'GET',
         headers: {
           'Content-Type': 'application/json',
-          'X-Internal-API-Key': PSA_INTERNAL_API_KEY,
+          [PSA_API_KEY_HEADER]: psaApiKey(),
           'X-Tenant-Id': tenantId,
         },
       });
@@ -364,7 +364,7 @@ class InboundService {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Internal-API-Key': PSA_INTERNAL_API_KEY,
+          [PSA_API_KEY_HEADER]: psaApiKey(),
           'X-Tenant-Id': tenantId,
         },
         body: JSON.stringify({
@@ -418,7 +418,7 @@ class InboundService {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Internal-API-Key': PSA_INTERNAL_API_KEY,
+          [PSA_API_KEY_HEADER]: psaApiKey(),
           'X-Tenant-Id': tenantId,
         },
         body: JSON.stringify({
