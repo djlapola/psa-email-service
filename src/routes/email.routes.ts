@@ -8,6 +8,68 @@ import { acceptsRotatableKey } from '../lib/api-key';
 
 const router = Router();
 
+// SendGrid allows at most 10 categories per message.
+const SENDGRID_CATEGORY_LIMIT = 10;
+
+/**
+ * Normalise caller-supplied `tags` into SendGrid's { name, value }[] shape.
+ *
+ * Accepts either:
+ *   - a plain object:            { tenant_id: 'abc', type: 'invoice' }
+ *   - an array of {name,value}:  [{ name: 'type', value: 'invoice' }]
+ *   - an array of bare strings:  ['invoice']  (legacy — treated as message types)
+ *
+ * Previously the route ran `Object.entries(tags)` unconditionally. On an array
+ * that yields ['0', ...] entries, so the array *index* became the category name
+ * and we emitted meaningless `0:invoice` / `1:ticket-created` categories in
+ * SendGrid. Those are permanent and can never be reclaimed.
+ */
+function normalizeTags(tags: unknown): { name: string; value: string }[] {
+  if (!tags) return [];
+
+  if (Array.isArray(tags)) {
+    return tags
+      .map((t) => {
+        if (t && typeof t === 'object' && 'name' in (t as object)) {
+          const { name, value } = t as { name: unknown; value: unknown };
+          return { name: String(name), value: String(value ?? '') };
+        }
+        // Bare scalar: historically these were message types passed positionally,
+        // which is exactly what produced the `0:`/`1:` category debris. Keep them
+        // under a proper `type:` key instead of an array index.
+        return { name: 'type', value: String(t) };
+      })
+      .filter((t) => t.name && t.value);
+  }
+
+  if (typeof tags === 'object') {
+    return Object.entries(tags as Record<string, unknown>)
+      .map(([name, value]) => ({ name, value: String(value) }))
+      .filter((t) => t.name && t.value);
+  }
+
+  return [];
+}
+
+/**
+ * Build the final SendGrid categories for a message: guarantee a `tenant_id`
+ * category (so the message is visible to per-tenant reporting), then append the
+ * normalised caller tags, capped at SendGrid's 10-category limit.
+ */
+function buildCategories(
+  tags: unknown,
+  tenantId?: string
+): { name: string; value: string }[] | undefined {
+  const normalized = normalizeTags(tags);
+  const withTenant =
+    tenantId && !normalized.some((t) => t.name === 'tenant_id')
+      ? [{ name: 'tenant_id', value: String(tenantId) }, ...normalized]
+      : normalized;
+  // tenant_id is first, so if we overflow the cap it is the one category kept.
+  const final = withTenant.slice(0, SENDGRID_CATEGORY_LIMIT);
+  return final.length ? final : undefined;
+}
+
 // API Key authentication middleware
 const authenticate = (req: Request, res: Response, next: NextFunction) => {
   const apiKey = req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '');
@@ -87,7 +149,7 @@ router.post('/send', async (req: Request, res: Response) => {
         fromPrefix,
         replyTo,
         tenantId,
-        tags: tags ? Object.entries(tags).map(([name, value]) => ({ name, value: String(value) })) : undefined,
+        tags: buildCategories(tags, tenantId),
         headers,
         attachments,
       });
