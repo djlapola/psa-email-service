@@ -28,11 +28,17 @@ class DomainService {
   private baseDomain: string;
   private prisma: PrismaClient;
   private inboundWebhookUrl: string;
+  private frontendIngressIp: string;
 
   constructor(prisma: PrismaClient) {
     this.baseDomain = process.env.BASE_DOMAIN || 'skyrack.com';
     this.prisma = prisma;
     this.inboundWebhookUrl = process.env.SENDGRID_INBOUND_WEBHOOK_URL || '';
+    // The frontend/web ingress IP that every tenant subdomain's A record points at. Configurable
+    // because a load-balancer or ingress change would otherwise silently break every newly
+    // provisioned tenant's subdomain (existing tenants keep their now-stale records). The default is
+    // the current *.skyrack.com wildcard target — the same IP deskside.skyrack.com resolves to.
+    this.frontendIngressIp = process.env.FRONTEND_INGRESS_IP || '34.111.191.155';
   }
 
   /**
@@ -114,6 +120,26 @@ class DomainService {
         recordIds.push(mxResult.id);
       } else {
         errors.push(`Failed to create MX record: ${mxResult.error}`);
+      }
+
+      // Step 3b: Create the A record for the tenant's WEB subdomain so <subdomain>.skyrack.com
+      // actually resolves and is served. The zone's *.skyrack.com wildcard cannot cover this below
+      // an Enterprise plan — Cloudflare only proxies wildcard DNS on Enterprise, so the wildcard
+      // resolves but the edge refuses to serve it — hence each tenant needs its own record.
+      // proxied MUST be true: it matches how deskside.skyrack.com is configured and is what makes
+      // the edge serve the subdomain at all. The id joins recordIds, so deprovision and CP's purge
+      // path remove it with the mail records — no orphan A record left pointing at the ingress.
+      const aResult = await cloudflareService.createDnsRecord({
+        type: 'A',
+        name: fullDomain,
+        content: this.frontendIngressIp,
+        proxied: true,
+      });
+
+      if (aResult.success && aResult.id) {
+        recordIds.push(aResult.id);
+      } else {
+        errors.push(`Failed to create A record for ${fullDomain}: ${aResult.error}`);
       }
 
       // Step 3.5: Register SendGrid inbound parse for this subdomain

@@ -4,7 +4,7 @@ const CLOUDFLARE_API_URL = 'https://api.cloudflare.com/client/v4';
 
 interface CloudflareDnsRecord {
   id?: string;
-  type: 'MX' | 'TXT' | 'CNAME';
+  type: 'A' | 'MX' | 'TXT' | 'CNAME';
   name: string;
   content: string;
   ttl?: number;
