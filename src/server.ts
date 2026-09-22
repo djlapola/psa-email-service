@@ -16,8 +16,19 @@ import { createDomainHealthService } from './services/domain-health.service';
 import { cloudflareService } from './services/cloudflare.service';
 import { seedSystemTemplates } from './seed/system-templates';
 import { acceptsRotatableKey, previousKeyStatus } from './lib/api-key';
+import { assertRequiredSecrets } from './lib/env';
 
 dotenv.config();
+
+// Fail fast BEFORE constructing services or binding the port: a missing required secret must crash
+// the process with a clear message rather than boot a service that reports healthy while every send
+// silently fails at SendGrid. See src/lib/env.ts for the required/recommended split and reasoning.
+try {
+  assertRequiredSecrets();
+} catch (err: any) {
+  console.error(`[Startup] ${err.message}`);
+  process.exit(1);
+}
 
 const app = express();
 const prisma = new PrismaClient();

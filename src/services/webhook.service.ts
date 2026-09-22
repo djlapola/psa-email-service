@@ -1,5 +1,6 @@
 import { PrismaClient } from '@prisma/client';
 import { PSA_API_KEY_HEADER, psaApiKey } from '../lib/psa-auth';
+import { webhookSigningSecret } from '../lib/env';
 
 export interface EmailEvent {
   event: 'email.delivered' | 'email.bounced' | 'email.complained' | 'email.failed';
@@ -319,7 +320,7 @@ export class WebhookService {
    */
   private generateSignature(event: EmailEvent | DomainHealthEvent | WebhookFailureEvent): string {
     const crypto = require('crypto');
-    const secret = process.env.EMAIL_SERVICE_WEBHOOK_SECRET || 'default-secret';
+    const secret = webhookSigningSecret();
     return crypto
       .createHmac('sha256', secret)
       .update(JSON.stringify(event))

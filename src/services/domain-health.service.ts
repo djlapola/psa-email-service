@@ -2,8 +2,9 @@ import sgClient from '@sendgrid/client';
 import { PrismaClient } from '@prisma/client';
 import { createDomainService } from './domain.service';
 import { createWebhookService, DomainHealthFailingRecord } from './webhook.service';
+import { sendgridApiKey } from '../lib/env';
 
-sgClient.setApiKey(process.env.SENDGRID_API_KEY || '');
+sgClient.setApiKey(sendgridApiKey());
 
 // A domain is only considered "stuck" (and re-alertable) once it has been in its
 // current state for this long — also the minimum gap between repeat alerts.

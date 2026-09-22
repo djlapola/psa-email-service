@@ -1,7 +1,8 @@
 import sgMail from '@sendgrid/mail';
 import { PrismaClient } from '@prisma/client';
+import { sendgridApiKey } from '../lib/env';
 
-sgMail.setApiKey(process.env.SENDGRID_API_KEY || '');
+sgMail.setApiKey(sendgridApiKey());
 
 export interface SendEmailOptions {
   to: string | string[];

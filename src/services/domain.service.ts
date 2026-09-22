@@ -1,8 +1,9 @@
 import sgClient from '@sendgrid/client';
 import { PrismaClient } from '@prisma/client';
 import { cloudflareService } from './cloudflare.service';
+import { sendgridApiKey } from '../lib/env';
 
-sgClient.setApiKey(process.env.SENDGRID_API_KEY || '');
+sgClient.setApiKey(sendgridApiKey());
 
 interface DomainProvisionResult {
   success: boolean;

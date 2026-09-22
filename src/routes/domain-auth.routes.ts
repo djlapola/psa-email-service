@@ -1,8 +1,9 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { PrismaClient, Prisma } from '@prisma/client';
 import sgClient from '@sendgrid/client';
+import { sendgridApiKey } from '../lib/env';
 
-sgClient.setApiKey(process.env.SENDGRID_API_KEY || '');
+sgClient.setApiKey(sendgridApiKey());
 
 const router = Router();
 
