@@ -10,7 +10,8 @@
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate deploy",
     "prisma:migrate:dev": "prisma migrate dev",
-    "seed:templates": "ts-node prisma/seed-templates.ts"
+    "seed:templates": "ts-node prisma/seed-templates.ts",
+    "test": "tsc -p tsconfig.test.json && ts-node --transpile-only src/test/index.ts"
   },
   "dependencies": {
     "@prisma/client": "^5.7.0",

@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { PrismaClient } from '@prisma/client';
 import { createInboundService } from '../services/inbound.service';
+import { PSA_API_KEY_HEADER } from '../lib/psa-auth';
 import multer from 'multer';
 
 const router = Router();
@@ -28,23 +29,20 @@ router.post('/sendgrid', upload.any(), async (req: Request, res: Response) => {
     const inboundService = createInboundService(prisma);
 
     const body = req.body;
+    const receivedAt = new Date().toISOString();
 
     console.log('[InboundRoutes:SendGrid] Received inbound email');
-    console.log('[InboundRoutes:SendGrid] Fields:', Object.keys(body));
 
     // Parse envelope to get all recipients
     let envelope: { to?: string[]; from?: string } = {};
     try {
       envelope = JSON.parse(body.envelope || '{}');
     } catch (e) {
-      console.warn('[InboundRoutes:SendGrid] Could not parse envelope:', body.envelope);
+      console.warn('[InboundRoutes:SendGrid] Could not parse envelope');
     }
 
-    console.log('[InboundRoutes:SendGrid] From:', body.from);
-    console.log('[InboundRoutes:SendGrid] To:', body.to);
-    console.log('[InboundRoutes:SendGrid] CC:', body.cc);
-    console.log('[InboundRoutes:SendGrid] Envelope:', JSON.stringify(envelope));
-    console.log('[InboundRoutes:SendGrid] Subject:', body.subject);
+    // Routing metadata only — never log bodies or attachment content.
+    console.log(`[InboundRoutes:SendGrid] From: ${body.from} | To: ${body.to} | Subject: ${body.subject}`);
 
     // Parse headers if present
     const headers = parseEmailHeaders(body.headers || '');
@@ -78,8 +76,6 @@ router.post('/sendgrid', upload.any(), async (req: Request, res: Response) => {
             contentId: contentId,
             size: file.size,
           });
-
-          console.log(`[InboundRoutes:SendGrid] Attachment: ${file.originalname} (${file.mimetype}, ${file.size} bytes, cid: ${contentId || 'none'})`);
         }
       }
     }
@@ -96,25 +92,56 @@ router.post('/sendgrid', upload.any(), async (req: Request, res: Response) => {
       headers: headers,
       attachments: attachments,
       envelope: envelope,
+      receivedAt,
     };
 
-    console.log(`[InboundRoutes:SendGrid] Processing email from: ${email.from} to: ${email.to} subject: ${email.subject}`);
-
-    // Process the inbound email
+    // Forward to PSA (PSA owns classification + failure tracking).
     const result = await inboundService.processInboundEmail(email);
 
-    if (result.success) {
-      console.log(`[InboundRoutes:SendGrid] Successfully processed email -> ticket: ${result.ticketId} (new: ${result.isNew})`);
-    } else {
-      console.error(`[InboundRoutes:SendGrid] Failed to process email: ${result.error}`);
+    // Map the forward outcome to the SendGrid response:
+    //   - PSA 2xx                      -> 200 (acknowledged)
+    //   - PSA client error (400/403/404 etc) / tenant not resolvable
+    //                                  -> 200 + one log line (retrying won't help)
+    //   - PSA 5xx / 408 / 429          -> 5xx (ask SendGrid to retry)
+    //   - timeout                      -> 504
+    //   - network error                -> 502
+    switch (result.kind) {
+      case 'psa-success':
+        return res.status(200).send('OK');
+      case 'tenant-unresolved':
+        console.warn(`[InboundRoutes:SendGrid] Acknowledged without forwarding — tenant not resolvable (${result.reason})`);
+        return res.status(200).send('OK');
+      case 'psa-client-error':
+        console.warn(`[InboundRoutes:SendGrid] PSA rejected payload (${result.status}) — acknowledging, retry would not help`);
+        return res.status(200).send('OK');
+      case 'psa-server-error': {
+        // Always surface a 5xx so SendGrid retries; echo PSA's 5xx, else 503.
+        const status = result.status >= 500 && result.status <= 599 ? result.status : 503;
+        if (result.status === 401) {
+          // Not bad mail — this service's PSA credential is wrong/stale. Name the
+          // likely cause so the on-call fixes config rather than hunting the email.
+          console.error(
+            `[InboundRoutes:SendGrid] PSA returned 401 Unauthorized — likely a PSA API key/header mismatch ` +
+              `(header '${PSA_API_KEY_HEADER}' from EMAIL_SERVICE_TO_PSA_API_KEY/PSA_INTERNAL_API_KEY). ` +
+              `Returning ${status} so SendGrid retries until the credential is corrected.`,
+          );
+        } else {
+          console.error(`[InboundRoutes:SendGrid] PSA upstream error (${result.status}) — returning ${status} so SendGrid retries`);
+        }
+        return res.status(status).send('Upstream error');
+      }
+      case 'timeout':
+        console.error('[InboundRoutes:SendGrid] PSA timed out — returning 504 so SendGrid retries');
+        return res.status(504).send('Upstream timeout');
+      case 'network-error':
+        console.error(`[InboundRoutes:SendGrid] PSA unreachable (${result.message}) — returning 502 so SendGrid retries`);
+        return res.status(502).send('Upstream unreachable');
     }
-
-    // Always return 200 to SendGrid to acknowledge receipt
-    res.status(200).send('OK');
   } catch (error: any) {
-    console.error('[InboundRoutes:SendGrid] Webhook processing error:', error);
-    // Still return 200 to prevent retries
-    res.status(200).send('OK');
+    // An error in our own parsing/forwarding, not PSA's. Return 5xx so the mail
+    // is retried rather than silently dropped. Never log the body/attachments.
+    console.error('[InboundRoutes:SendGrid] Internal webhook error:', error?.message || error);
+    return res.status(500).send('Internal error');
   }
 });
 

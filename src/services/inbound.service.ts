@@ -22,6 +22,8 @@ interface InboundEmail {
     to?: string[];
     from?: string;
   };
+  // ISO timestamp stamped by the route when SendGrid delivered the webhook.
+  receivedAt?: string;
 }
 
 interface TicketMatch {
@@ -34,6 +36,157 @@ interface ParsedEmailAddress {
   email: string;
   subdomain: string | null;
   baseDomain: string;
+}
+
+// ---------------------------------------------------------------------------
+// Thin-forwarder types + pure helpers
+//
+// email-service no longer classifies inbound mail. It resolves the tenant from
+// the recipient subdomain and forwards the parsed message to PSA, which owns
+// classification (reply vs. new ticket) and failure tracking. Everything in
+// this block is deliberately pure (no Prisma, no network) so it is unit-testable
+// without infrastructure.
+// ---------------------------------------------------------------------------
+
+/** Hard cap on how long we wait for PSA before treating it as a timeout. */
+const PSA_FORWARD_TIMEOUT_MS = 25_000;
+
+export interface PsaInboundAttachment {
+  filename: string;
+  content: string; // base64
+  mimeType: string;
+  contentId?: string;
+  fileSize: number;
+}
+
+export interface PsaInboundPayload {
+  tenantId: string;
+  tenantSubdomain: string;
+  fromEmail: string;
+  fromName: string;
+  subject: string;
+  bodyText: string;
+  bodyHtml: string;
+  messageId: string;
+  recipients: { to: string[]; cc: string[] };
+  inReplyTo: string | null;
+  references: string[];
+  autoSubmitted: string | null;
+  precedence: string | null;
+  xAutoreply: string | null;
+  receivedAt: string;
+  attachments: PsaInboundAttachment[];
+}
+
+/**
+ * Outcome of a forward attempt. The route maps this to the SendGrid response:
+ *   psa-success / psa-client-error / tenant-unresolved -> 200 (ack, don't retry)
+ *   psa-server-error / timeout / network-error         -> 5xx (ask SendGrid to retry)
+ */
+export type ForwardResult =
+  | { kind: 'psa-success' }
+  | { kind: 'psa-client-error'; status: number }
+  | { kind: 'psa-server-error'; status: number }
+  | { kind: 'timeout' }
+  | { kind: 'network-error'; message: string }
+  | { kind: 'tenant-unresolved'; reason: string };
+
+/** Extract one bare lowercased address from a "Name <a@b>" or "a@b" string. */
+export function extractOneAddress(raw: string): string {
+  const m = raw.match(/<([^>]+)>/);
+  return (m ? m[1] : raw).trim().toLowerCase();
+}
+
+/** Split a comma-separated recipient header into bare lowercased addresses. */
+export function extractAddresses(raw?: string): string[] {
+  if (!raw) return [];
+  return raw
+    .split(',')
+    .map((s) => {
+      const m = s.match(/<([^>]+)>/);
+      return (m ? m[1] : s).trim().toLowerCase();
+    })
+    .filter(Boolean);
+}
+
+function dedupe(arr: string[]): string[] {
+  return Array.from(new Set(arr));
+}
+
+/**
+ * Build the recipients object PSA requires to validate the mail belongs to the
+ * tenant. `to` is the union of the parsed To header and the SMTP envelope
+ * recipients (envelope.to is the address SendGrid actually received for); `cc`
+ * is the parsed Cc header. Unlike the legacy watcher logic, the tenant's own
+ * support@ address is NOT stripped — PSA needs the real recipient set.
+ */
+export function buildRecipients(email: InboundEmail): { to: string[]; cc: string[] } {
+  const envelopeTo = (email.envelope?.to || []).map((a) => a.trim().toLowerCase()).filter(Boolean);
+  const to = dedupe([...extractAddresses(email.to), ...envelopeTo]);
+  const cc = dedupe(extractAddresses(email.cc));
+  return { to, cc };
+}
+
+/**
+ * Build the exact JSON payload POSTed to PSA's inbound endpoint. Bodies are
+ * forwarded verbatim (no quoted-reply stripping) — PSA owns that now.
+ */
+export function buildPsaInboundPayload(
+  email: InboundEmail,
+  tenantId: string,
+  tenantSubdomain: string,
+): PsaInboundPayload {
+  const headers = email.headers || {};
+  const fromEmail = extractOneAddress(email.from || '');
+  const fromName =
+    (email.from || '').replace(/<.*>/, '').trim().replace(/^["']|["']$/g, '') || fromEmail;
+  const references = (headers['references'] || headers['References'] || '')
+    .split(/\s+/)
+    .filter(Boolean);
+
+  return {
+    tenantId,
+    tenantSubdomain,
+    fromEmail,
+    fromName,
+    subject: email.subject || '',
+    bodyText: email.text || '',
+    bodyHtml: email.html || '',
+    messageId: headers['message-id'] || headers['Message-ID'] || '',
+    recipients: buildRecipients(email),
+    inReplyTo: headers['in-reply-to'] || headers['In-Reply-To'] || null,
+    references,
+    autoSubmitted: headers['auto-submitted'] || headers['Auto-Submitted'] || null,
+    precedence: headers['precedence'] || headers['Precedence'] || null,
+    xAutoreply: headers['x-autoreply'] || headers['X-Autoreply'] || null,
+    receivedAt: email.receivedAt || new Date().toISOString(),
+    attachments: (email.attachments || []).map((a) => ({
+      filename: a.filename,
+      content: a.content,
+      mimeType: a.contentType,
+      contentId: a.contentId,
+      fileSize: a.size || 0,
+    })),
+  };
+}
+
+/**
+ * Classify a PSA HTTP status into a forward outcome.
+ *   2xx                 -> success (PSA accepted; any ticket outcome is PSA's business)
+ *   5xx, 408, 429, 401  -> server-error (transient; retrying may succeed)
+ *   other 4xx (400/403/404…) -> client-error (deterministic; retrying won't help)
+ *
+ * 401 is treated as retryable on purpose: a 401 from PSA means this service's
+ * API key/header is wrong or stale (a config/rotation problem), NOT bad mail.
+ * Acking it would silently drop real mail during an auth misconfiguration, so we
+ * force SendGrid to keep retrying while the credential is fixed.
+ */
+export function classifyPsaStatus(status: number): ForwardResult {
+  if (status >= 200 && status < 300) return { kind: 'psa-success' };
+  if (status >= 500 || status === 408 || status === 429 || status === 401) {
+    return { kind: 'psa-server-error', status };
+  }
+  return { kind: 'psa-client-error', status };
 }
 
 class InboundService {
@@ -127,6 +280,19 @@ class InboundService {
 
     return { tenantId: config.tenantId, domain: config.domain || domain };
   }
+
+  // =========================================================================
+  // DEPRECATED — local classification (unused as of the thin-forwarder change).
+  //
+  // PSA now owns reply-vs-new-ticket classification. The methods below
+  // (matchEmailToTicket, findTicketByMessageId, parseTicketIdFromText,
+  // findTicketByNumber, storeMessageId, createTicketFromEmail,
+  // addCommentToTicket, getAdditionalRecipients, stripQuotedText) are no longer
+  // called by processInboundEmail. They are retained for one release so the
+  // change is a pure routing swap and easy to revert; they can be deleted — see
+  // the report's "dead code" list. Nothing in the inbound path reads or writes
+  // the EmailMessageId table anymore.
+  // =========================================================================
 
   /**
    * Try to match an inbound email to an existing ticket
@@ -315,41 +481,63 @@ class InboundService {
   }
 
   /**
-   * Process an inbound email - route to PSA
+   * Resolve the tenant subdomain from the mail's recipients. Prefers the SMTP
+   * envelope recipients (the address SendGrid actually received for), then the
+   * To header, and returns the first address under the base domain.
    */
-  async processInboundEmail(email: InboundEmail): Promise<{ success: boolean; ticketId?: string; isNew?: boolean; error?: string }> {
+  private resolveSubdomain(email: InboundEmail): string | null {
+    const candidates = [...(email.envelope?.to || []), ...extractAddresses(email.to)];
+    for (const cand of candidates) {
+      const parsed = this.parseEmailAddress(cand);
+      if (parsed.subdomain) return parsed.subdomain;
+    }
+    return null;
+  }
+
+  /**
+   * Thin forwarder: resolve the tenant from the recipient subdomain and POST the
+   * parsed message to PSA. No local classification, no EmailMessageId access.
+   * Returns a ForwardResult the route maps to the SendGrid response.
+   */
+  async processInboundEmail(email: InboundEmail): Promise<ForwardResult> {
+    const subdomain = this.resolveSubdomain(email);
+    if (!subdomain) {
+      return { kind: 'tenant-unresolved', reason: `no base-domain recipient in to/envelope` };
+    }
+
+    const tenant = await this.getTenantBySubdomain(subdomain);
+    if (!tenant) {
+      return { kind: 'tenant-unresolved', reason: `unknown subdomain: ${subdomain}` };
+    }
+
+    const payload = buildPsaInboundPayload(email, tenant.tenantId, subdomain);
+    return this.forwardToPsa(payload);
+  }
+
+  /**
+   * POST the inbound payload to PSA's internal inbound endpoint with a 25s
+   * timeout. Never logs bodies or attachments.
+   */
+  private async forwardToPsa(payload: PsaInboundPayload): Promise<ForwardResult> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), PSA_FORWARD_TIMEOUT_MS);
     try {
-      // Parse the "to" address to determine tenant
-      const toAddress = email.to.split(',')[0].trim(); // Take first recipient
-      const parsed = this.parseEmailAddress(toAddress);
-
-      if (!parsed.subdomain) {
-        console.error(`[InboundService] Could not determine tenant from address: ${toAddress}`);
-        return { success: false, error: 'Could not determine tenant from recipient address' };
-      }
-
-      // Look up tenant
-      const tenant = await this.getTenantBySubdomain(parsed.subdomain);
-      if (!tenant) {
-        console.error(`[InboundService] Tenant not found for subdomain: ${parsed.subdomain}`);
-        return { success: false, error: `Tenant not found for subdomain: ${parsed.subdomain}` };
-      }
-
-      console.log(`[InboundService] Processing email for tenant: ${tenant.tenantId}`);
-
-      // Try to match to existing ticket
-      const match = await this.matchEmailToTicket(email, tenant.tenantId);
-
-      if (match) {
-        // Add comment to existing ticket
-        return await this.addCommentToTicket(email, match.ticketId, tenant.tenantId, parsed.subdomain);
-      } else {
-        // Create new ticket
-        return await this.createTicketFromEmail(email, tenant.tenantId, parsed.subdomain);
-      }
+      const response = await fetch(`${PSA_INTERNAL_API_URL}/inbound/email`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          [PSA_API_KEY_HEADER]: psaApiKey(),
+          'X-Tenant-Id': payload.tenantId,
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      return classifyPsaStatus(response.status);
     } catch (error: any) {
-      console.error(`[InboundService] Process error:`, error);
-      return { success: false, error: error.message };
+      if (error?.name === 'AbortError') return { kind: 'timeout' };
+      return { kind: 'network-error', message: error?.message || 'unknown' };
+    } finally {
+      clearTimeout(timer);
     }
   }
 

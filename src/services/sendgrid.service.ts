@@ -30,6 +30,59 @@ export interface SendEmailResult {
   from?: string;
 }
 
+/**
+ * Build the SendGrid message object from resolved send options. Pure (no network,
+ * no API-key side effects) so the header pass-through can be unit-tested.
+ *
+ * Message-ID pass-through: when the caller supplies `options.headers` (PSA sets a
+ * `Message-ID: <ticket-…@<subdomain>.skyrack.com>` header on the raw-HTML send it
+ * asks us to deliver, for threading), those headers are placed verbatim on the
+ * SendGrid `headers` field. SendGrid's v3 API accepts a custom `Message-ID` here
+ * and uses it as the delivered message's Message-ID instead of generating one, so
+ * replies thread back to PSA's own identifier. We do not synthesize or rewrite it.
+ */
+export function buildSendGridMessage(
+  options: SendEmailOptions,
+  from: string,
+  replyTo?: string,
+): sgMail.MailDataRequired {
+  const msg: sgMail.MailDataRequired = {
+    from,
+    to: Array.isArray(options.to) ? options.to : [options.to],
+    subject: options.subject,
+    html: options.html,
+    text: options.text || 'Please view this email in an HTML-compatible email client.',
+    replyTo: replyTo,
+    headers: options.headers,
+    // Disable SendGrid click + open tracking on all outbound mail. Nothing in this
+    // service consumes 'click'/'open' webhook events, so the data is collected with no
+    // consumer — and it only lands in Skyrack's SendGrid account, never the MSP whose
+    // clients generated it. Worse, click tracking rewrites portal links to an opaque
+    // ct.sendgrid.net redirect, which reads as phishing to security-trained recipients
+    // and link scanners in transactional PSA mail. enableText:false is required so the
+    // rewrite is also suppressed in the plain-text part, not just the HTML.
+    trackingSettings: {
+      clickTracking: { enable: false, enableText: false },
+      openTracking: { enable: false },
+    },
+  };
+
+  if (options.tags && options.tags.length > 0) {
+    msg.categories = options.tags.map((t) => `${t.name}:${t.value}`);
+  }
+
+  if (options.attachments?.length) {
+    msg.attachments = options.attachments.map((a) => ({
+      content: a.content,
+      filename: a.filename,
+      type: a.type,
+      disposition: a.disposition || 'attachment',
+    }));
+  }
+
+  return msg;
+}
+
 export class SendGridService {
   private prisma: PrismaClient;
 
@@ -196,39 +249,7 @@ export class SendGridService {
     const replyTo = options.replyTo || tenantConfig.replyTo;
 
     try {
-      const msg: sgMail.MailDataRequired = {
-        from,
-        to: Array.isArray(options.to) ? options.to : [options.to],
-        subject: options.subject,
-        html: options.html,
-        text: options.text || 'Please view this email in an HTML-compatible email client.',
-        replyTo: replyTo,
-        headers: options.headers,
-        // Disable SendGrid click + open tracking on all outbound mail. Nothing in this
-        // service consumes 'click'/'open' webhook events, so the data is collected with no
-        // consumer — and it only lands in Skyrack's SendGrid account, never the MSP whose
-        // clients generated it. Worse, click tracking rewrites portal links to an opaque
-        // ct.sendgrid.net redirect, which reads as phishing to security-trained recipients
-        // and link scanners in transactional PSA mail. enableText:false is required so the
-        // rewrite is also suppressed in the plain-text part, not just the HTML.
-        trackingSettings: {
-          clickTracking: { enable: false, enableText: false },
-          openTracking: { enable: false },
-        },
-      };
-
-      if (options.tags && options.tags.length > 0) {
-        msg.categories = options.tags.map(t => `${t.name}:${t.value}`);
-      }
-
-      if (options.attachments?.length) {
-        msg.attachments = options.attachments.map(a => ({
-          content: a.content,
-          filename: a.filename,
-          type: a.type,
-          disposition: a.disposition || 'attachment',
-        }));
-      }
+      const msg = buildSendGridMessage(options, from, replyTo);
 
       const [response] = await sgMail.send(msg);
 

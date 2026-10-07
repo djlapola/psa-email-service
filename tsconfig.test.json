@@ -1,0 +1,13 @@
+{
+  // Type-check config for the test suite. The production tsconfig.json excludes
+  // test files (so `npm run build` / the Dockerfile emit no tests into dist/).
+  // This config re-includes them and only type-checks (noEmit) — used by
+  // `npm test` so the tests are still fully type-checked even though the build
+  // and the `npx tsc --noEmit` gate no longer see them.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}
