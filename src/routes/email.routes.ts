@@ -203,6 +203,7 @@ router.post('/send', async (req: Request, res: Response) => {
       from,
       fromPrefix,
       replyTo,
+      headers,
     });
 
     res.status(202).json({
@@ -245,6 +246,7 @@ router.post('/send/bulk', async (req: Request, res: Response) => {
           tenantId: email.tenantId,
           from: email.from,
           replyTo: email.replyTo,
+          headers: email.headers,
         });
         results.push({ to: email.to, emailId });
       } catch (error) {

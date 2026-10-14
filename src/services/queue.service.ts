@@ -12,7 +12,16 @@ export interface QueuedEmail {
   from?: string;
   fromPrefix?: string;
   replyTo?: string;
+  // Caller-supplied headers (e.g. PSA's Auto-Submitted, X-Auto-Response-Suppress,
+  // Message-ID) passed through verbatim to SendGrid. Email-service never adds or
+  // rewrites these.
+  headers?: Record<string, string>;
 }
+
+// Reserved key under which caller headers are stashed inside the EmailLog.metadata
+// JSON column so they survive a restart reload. The in-memory queue carries headers
+// in their own field; this is only the durable persistence seam (no schema change).
+const HEADERS_META_KEY = '__headers';
 
 const MAX_RETRIES = 3;
 const RETRY_DELAYS = [1000, 5000, 30000]; // 1s, 5s, 30s
@@ -49,7 +58,13 @@ export class QueueService {
       throw new Error(`Template not found: ${email.template}`);
     }
 
-    // Create log entry (from is a placeholder; updated post-send with the resolved address)
+    // Create log entry (from is a placeholder; updated post-send with the resolved address).
+    // Stash any caller headers inside the metadata JSON column (reserved key) so they are
+    // not lost if the process restarts before the job is sent; stripped back out on reload.
+    const metadata =
+      email.headers && Object.keys(email.headers).length > 0
+        ? { ...email.data, [HEADERS_META_KEY]: email.headers }
+        : email.data;
     const log = await this.prisma.emailLog.create({
       data: {
         to: email.to,
@@ -58,7 +73,7 @@ export class QueueService {
         template: email.template,
         status: 'queued',
         tenantId: email.tenantId,
-        metadata: email.data as object,
+        metadata: metadata as object,
         attempts: 0,
       },
     });
@@ -74,6 +89,7 @@ export class QueueService {
       from: email.from,
       fromPrefix: email.fromPrefix,
       replyTo: email.replyTo,
+      headers: email.headers,
     });
 
     console.log(`Email queued: ${log.id} -> ${email.to} (${email.template})`);
@@ -161,6 +177,7 @@ export class QueueService {
       replyTo: email.replyTo,
       tenantId: email.tenantId,
       tags: email.tenantId ? [{ name: 'tenant_id', value: email.tenantId }] : undefined,
+      headers: email.headers,
     });
 
     if (result.success) {
@@ -245,13 +262,26 @@ export class QueueService {
     });
 
     for (const log of pending) {
+      // Recover caller headers stashed under the reserved key and strip them back out
+      // so template data stays clean. Rows persisted before this key existed simply
+      // yield no headers (undefined), so pre-existing jobs process unchanged.
+      const meta = (log.metadata as Record<string, unknown>) || {};
+      let data = meta;
+      let headers: Record<string, string> | undefined;
+      if (meta && typeof meta === 'object' && HEADERS_META_KEY in meta) {
+        const { [HEADERS_META_KEY]: stashed, ...rest } = meta;
+        headers = stashed as Record<string, string>;
+        data = rest;
+      }
+
       this.queue.push({
         id: log.id,
         to: log.to,
         template: log.template,
-        data: (log.metadata as Record<string, unknown>) || {},
+        data,
         tenantId: log.tenantId || undefined,
         from: log.from,
+        headers,
       });
     }
 
