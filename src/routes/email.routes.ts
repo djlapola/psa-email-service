@@ -11,6 +11,86 @@ const router = Router();
 // SendGrid allows at most 10 categories per message.
 const SENDGRID_CATEGORY_LIMIT = 10;
 
+// Cap on forwarded SendGrid reason/response text. SendGrid 'reason' is usually a short
+// SMTP string but can occasionally carry a long provider response; bound it so PSA and
+// our own EmailLog.error never receive an unbounded blob.
+const MAX_REASON_LENGTH = 500;
+
+/** Coerce a SendGrid reason/response to a bounded string, or undefined when empty. */
+function truncateReason(reason: unknown): string | undefined {
+  if (reason === undefined || reason === null || reason === '') return undefined;
+  const s = String(reason);
+  return s.length > MAX_REASON_LENGTH ? s.slice(0, MAX_REASON_LENGTH) : s;
+}
+
+/** Raw SendGrid detail forwarded to PSA alongside the collapsed `event` field. */
+export interface SendGridForwardDetail {
+  sgEvent: string;      // raw SendGrid event name
+  sgType?: string;      // SendGrid 'type' (e.g. 'bounce' | 'blocked')
+  status?: string;      // SMTP status code (e.g. '5.1.10')
+  reason?: string;      // SendGrid 'reason' or 'response', truncated
+  sgTimestamp?: number; // SendGrid event unix timestamp
+  sgMessageId?: string; // SendGrid message id, filter suffix stripped
+}
+
+export interface SendGridEventClassification {
+  sgMessageId?: string;
+  eventType: string;
+  // Our EmailLog status for this event, or null to leave status unchanged.
+  newStatus: 'delivered' | 'bounced' | 'complained' | null;
+  // The collapsed event to forward to PSA, or null to not forward.
+  webhookEvent: 'email.bounced' | 'email.complained' | null;
+  detail: SendGridForwardDetail;
+}
+
+/**
+ * Pure mapping of a raw SendGrid Event Webhook entry to (a) our EmailLog status, (b) the
+ * collapsed PSA event (backward compatible), and (c) the raw detail forwarded alongside it.
+ *
+ * Forwarding policy (which SendGrid events reach PSA):
+ *   - delivered           → status 'delivered',  NOT forwarded
+ *   - bounce (any type)    → status 'bounced',    forwarded as email.bounced (sgType distinguishes bounce vs blocked)
+ *   - dropped (any reason) → status 'bounced',    forwarded as email.bounced (reason carries the drop cause)
+ *   - spamreport           → status 'complained', forwarded as email.complained
+ *   - deferred             → status unchanged,    NOT forwarded (transient; caller logs only)
+ *   - processed / unsubscribe / open / click / unknown → status unchanged, NOT forwarded
+ */
+export function classifySendGridEvent(event: any): SendGridEventClassification {
+  const sgMessageId =
+    typeof event?.sg_message_id === 'string' ? event.sg_message_id.split('.')[0] : undefined;
+  const eventType: string = event?.event;
+
+  let newStatus: SendGridEventClassification['newStatus'] = null;
+  let webhookEvent: SendGridEventClassification['webhookEvent'] = null;
+
+  switch (eventType) {
+    case 'delivered':
+      newStatus = 'delivered';
+      break;
+    case 'bounce':
+    case 'dropped':
+      newStatus = 'bounced';
+      webhookEvent = 'email.bounced';
+      break;
+    case 'spamreport':
+      newStatus = 'complained';
+      webhookEvent = 'email.complained';
+      break;
+    // deferred / processed / unsubscribe / open / click / etc. → no status change, not forwarded
+  }
+
+  const detail: SendGridForwardDetail = {
+    sgEvent: eventType,
+    sgType: event?.type || undefined,
+    status: event?.status || undefined,
+    reason: truncateReason(event?.reason || event?.response),
+    sgTimestamp: typeof event?.timestamp === 'number' ? event.timestamp : undefined,
+    sgMessageId,
+  };
+
+  return { sgMessageId, eventType, newStatus, webhookEvent, detail };
+}
+
 /**
  * Normalise caller-supplied `tags` into SendGrid's { name, value }[] shape.
  *
@@ -692,8 +772,7 @@ router.post('/webhooks/sendgrid', async (req: Request, res: Response) => {
     const webhookService = new WebhookService(prisma);
 
     for (const event of events) {
-      const sgMessageId = event.sg_message_id?.split('.')[0]; // SendGrid appends .filter info
-      const eventType = event.event; // delivered, bounce, dropped, deferred, open, click, etc.
+      const { sgMessageId, eventType, newStatus, webhookEvent, detail } = classifySendGridEvent(event);
 
       if (!sgMessageId) continue;
 
@@ -707,49 +786,40 @@ router.post('/webhooks/sendgrid', async (req: Request, res: Response) => {
         continue;
       }
 
-      // Map SendGrid events to our status values
-      let newStatus: string | null = null;
-      let webhookEvent: string | null = null;
-
-      switch (eventType) {
-        case 'delivered':
-          newStatus = 'delivered';
-          break;
-        case 'bounce':
-        case 'dropped':
-          newStatus = 'bounced';
-          webhookEvent = 'email.bounced';
-          break;
-        case 'spamreport':
-          newStatus = 'complained';
-          webhookEvent = 'email.complained';
-          break;
-        case 'deferred':
-          // Don't change status for deferred, just log
-          console.log(`SendGrid webhook: email ${emailLog.id} deferred — ${event.reason || 'no reason'}`);
-          continue;
+      // Deferred is a transient retry by SendGrid, NOT a bounce. Deliberately log-only —
+      // never forwarded to PSA — so a temporary greylist/defer is not mistaken for a
+      // delivery failure. (This was already the behaviour; preserved.)
+      if (eventType === 'deferred') {
+        console.log(`SendGrid webhook: email ${emailLog.id} deferred — ${event.reason || 'no reason'}`);
+        continue;
       }
 
       if (newStatus) {
         await prisma.emailLog.update({
           where: { id: emailLog.id },
+          // Record the bounded reason on the existing EmailLog.error field. No dedicated
+          // field exists for the structured sgType/SMTP-status detail (see schema note),
+          // so that is forwarded to PSA only — recording it here would require a migration.
           data: {
             status: newStatus,
-            error: event.reason || event.response || undefined,
+            error: detail.reason,
           },
         });
         console.log(`SendGrid webhook: email ${emailLog.id} status updated to ${newStatus}`);
       }
 
-      // Notify CP/PSA about bounces and complaints
+      // Notify CP/PSA about bounces and complaints. Keep the collapsed `event` field for
+      // backward compatibility, but forward the raw SendGrid detail (`detail`) alongside it
+      // so PSA can tell a hard bounce (type 'bounce') from a block (type 'blocked') or a
+      // drop reason. The HMAC signature covers these fields (signed over the whole event).
       if (webhookEvent) {
         await webhookService.notifyEmailEvent({
-          event: webhookEvent as any,
+          event: webhookEvent,
           emailId: emailLog.id,
           to: emailLog.to,
           tenantId: emailLog.tenantId || undefined,
           template: emailLog.template,
-          reason: event.reason || event.response,
+          ...detail,
         });
       }
     }

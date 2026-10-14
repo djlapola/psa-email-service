@@ -11,6 +11,17 @@ export interface EmailEvent {
   reason?: string;
   error?: string;
   messageId?: string;
+  // Raw SendGrid event detail, forwarded so PSA can distinguish a hard bounce
+  // (type 'bounce') from a block (type 'blocked') or other soft failure. These are
+  // populated from the SendGrid Event Webhook; they are absent on internally-generated
+  // events such as email.failed from the queue's max-retries path (no SendGrid event
+  // exists behind those). The HMAC signature covers them automatically because it is
+  // computed over JSON.stringify(event).
+  sgEvent?: string;      // raw SendGrid event name, e.g. 'bounce' | 'dropped' | 'spamreport'
+  sgType?: string;       // SendGrid 'type' field, e.g. 'bounce' | 'blocked' (may be absent)
+  status?: string;       // SMTP status code, e.g. '5.1.10' (may be absent)
+  sgTimestamp?: number;  // SendGrid event unix timestamp (may be absent)
+  sgMessageId?: string;  // SendGrid message id (sg_message_id, filter suffix stripped)
 }
 
 export interface DomainHealthFailingRecord {

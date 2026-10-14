@@ -9,3 +9,4 @@
 import '../services/inbound.service.test';
 import '../services/sendgrid.service.test';
 import '../services/queue.service.test';
+import '../routes/email.routes.test';
