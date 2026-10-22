@@ -1,4 +1,6 @@
 import { PrismaClient, EmailTemplate } from '@prisma/client';
+import { renderTemplateString } from '../lib/render-template-string';
+import { escapeHtml } from '../lib/html-escape';
 
 export interface RenderedTemplate {
   subject: string;
@@ -54,9 +56,14 @@ export class TemplateService {
    * Render a template with the provided data
    */
   renderTemplate(template: EmailTemplate, data: Record<string, unknown>): RenderedTemplate {
-    const subject = this.interpolate(template.subject, data);
-    const html = this.interpolate(template.htmlBody, data);
-    const text = template.textBody ? this.interpolate(template.textBody, data) : this.stripHtml(html);
+    const subject = renderTemplateString(template.subject, data, 'subject');
+    const html = renderTemplateString(template.htmlBody, data, 'html');
+    // Fallback text is derived from a TEXT-mode substitution of the HTML template (not the
+    // escaped html above), so a value's `&`/`<` never leak into the plain-text part as
+    // &amp;/&lt; entities before tag-stripping.
+    const text = template.textBody
+      ? renderTemplateString(template.textBody, data, 'text')
+      : this.stripHtml(renderTemplateString(template.htmlBody, data, 'text'));
 
     return { subject, html, text };
   }
@@ -215,37 +222,6 @@ export class TemplateService {
   }
 
   /**
-   * Simple interpolation of {{variable}} patterns
-   * Also handles basic {{#if variable}}...{{/if}} conditionals
-   */
-  private interpolate(template: string, data: Record<string, unknown>): string {
-    let result = template;
-
-    // Handle {{#if variable}}content{{/if}} blocks
-    result = result.replace(
-      /\{\{#if\s+(\w+)\}\}([\s\S]*?)\{\{\/if\}\}/g,
-      (match, varName, content) => {
-        const value = data[varName];
-        if (value !== undefined && value !== null && value !== '' && value !== false && value !== 0) {
-          return content;
-        }
-        return '';
-      }
-    );
-
-    // Handle simple {{variable}} replacements
-    result = result.replace(/\{\{(\w+)\}\}/g, (match, varName) => {
-      const value = data[varName];
-      if (value !== undefined && value !== null) {
-        return String(value);
-      }
-      return match; // Keep original if no value provided
-    });
-
-    return result;
-  }
-
-  /**
    * Strip HTML tags for plain text fallback
    */
   private stripHtml(html: string): string {
@@ -271,19 +247,42 @@ export function injectAttachmentIndicator(
   data: Record<string, unknown>
 ): { html: string; text: string } {
   const count = Number(data?.attachmentCount) || 0;
-  const portalUrl = data?.portalTicketUrl ? String(data.portalTicketUrl) : '';
+  const rawUrl = data?.portalTicketUrl != null ? String(data.portalTicketUrl) : '';
 
-  if (count <= 0 || !portalUrl) {
+  // Original gate: no indicator at all unless there are attachments AND a portal URL was
+  // supplied. A PRESENT-but-invalid URL still renders (as the no-link variant below); only
+  // a missing/empty URL suppresses the indicator entirely.
+  if (count <= 0 || !rawUrl) {
     return rendered;
   }
 
-  // Skip if already injected (e.g. by template {{#if}} block)
-  if (rendered.html.includes('View in portal')) {
+  // Skip if an attachment indicator is already present \u2014 either a template {{#if}} block
+  // (which prints "View in portal") or a prior call (the paperclip entity is our marker).
+  if (rendered.html.includes('View in portal') || rendered.html.includes('&#128206;')) {
     return rendered;
   }
 
-  const htmlIndicator = `<p style="margin: 16px 0;">&#128206; ${count} attachment(s) \u2014 <a href="${portalUrl}">View in portal</a></p>`;
-  const textIndicator = `\n\u{1F4CE} ${count} attachment(s) \u2014 View in portal: ${portalUrl}\n`;
+  // Only turn portalTicketUrl into a link if it is a real http(s) URL. The value comes from
+  // caller `data`, so an unvalidated string in an href is an injection vector (javascript:,
+  // attribute breakout). Present-but-invalid \u2192 show the indicator with NO link.
+  let safeUrl: string | null = null;
+  if (rawUrl) {
+    try {
+      const parsed = new URL(rawUrl);
+      if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+        safeUrl = rawUrl;
+      }
+    } catch {
+      safeUrl = null;
+    }
+  }
+
+  const htmlIndicator = safeUrl
+    ? `<p style="margin: 16px 0;">&#128206; ${count} attachment(s) \u2014 <a href="${escapeHtml(safeUrl)}">View in portal</a></p>`
+    : `<p style="margin: 16px 0;">&#128206; ${count} attachment(s)</p>`;
+  const textIndicator = safeUrl
+    ? `\n\u{1F4CE} ${count} attachment(s) \u2014 View in portal: ${safeUrl}\n`
+    : `\n\u{1F4CE} ${count} attachment(s)\n`;
 
   // HTML: insert before the CTA button wrapper, or before </body>
   let html = rendered.html;

@@ -150,6 +150,52 @@ function buildCategories(
   return final.length ? final : undefined;
 }
 
+/**
+ * True if an address field contains a CR or LF. The field may be a single string or an
+ * array of strings (to/cc/bcc can be either); every element is checked. Non-string
+ * elements are ignored. Used to REJECT header-injection attempts in address fields.
+ */
+export function addressFieldHasCrlf(value: unknown): boolean {
+  if (typeof value === 'string') return /[\r\n]/.test(value);
+  if (Array.isArray(value)) return value.some((v) => typeof v === 'string' && /[\r\n]/.test(v));
+  return false;
+}
+
+/** Return the first of to/cc/bcc/from/replyTo that contains CR/LF, or null if all clean. */
+export function firstCrlfAddressField(fields: {
+  to?: unknown;
+  cc?: unknown;
+  bcc?: unknown;
+  from?: unknown;
+  replyTo?: unknown;
+}): string | null {
+  for (const name of ['to', 'cc', 'bcc', 'from', 'replyTo'] as const) {
+    if (addressFieldHasCrlf(fields[name])) return name;
+  }
+  return null;
+}
+
+/**
+ * Collapse every CR/LF run to a single space. Used to HARDEN (never reject) the caller
+ * subject and caller header names/values on the raw-HTML path — PSA's References/Message-ID
+ * headers must survive, so folding is used instead of rejection.
+ */
+export function stripCrlf(value: string): string {
+  return value.replace(/[\r\n]+/g, ' ');
+}
+
+/** Apply stripCrlf to every header name and value, returning a new map. */
+export function sanitizeHeaders(
+  headers: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (!headers) return headers;
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    out[stripCrlf(name)] = stripCrlf(String(value));
+  }
+  return out;
+}
+
 // API Key authentication middleware
 const authenticate = (req: Request, res: Response, next: NextFunction) => {
   const apiKey = req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '');
@@ -188,6 +234,17 @@ router.post('/send', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Provide either from or fromPrefix, not both' });
     }
 
+    // Reject CR/LF in any address field (header-injection guard). These cannot be folded
+    // silently — a newline in an address is always malformed input, never legitimate.
+    const crlfField = firstCrlfAddressField({ to, cc, bcc, from, replyTo });
+    if (crlfField) {
+      return res.status(400).json({ error: `${crlfField} must not contain CR or LF characters` });
+    }
+
+    // Fold CR/LF in caller header names/values to a single space (never reject — PSA's
+    // References/Message-ID must survive). Used on whichever path sends below.
+    const safeHeaders = sanitizeHeaders(headers);
+
     // Debug: log attachment data for ticket-comment emails (both paths)
     if (template === 'ticket-comment' || (subject && data?.attachmentCount !== undefined)) {
       console.log(`[EmailRoutes] ticket-comment send request — path: ${html ? 'raw-html' : 'template'}, attachmentCount: ${data?.attachmentCount} (${typeof data?.attachmentCount}), portalTicketUrl: ${data?.portalTicketUrl}`);
@@ -197,6 +254,9 @@ router.post('/send', async (req: Request, res: Response) => {
     if (html && subject) {
       const { SendGridService } = require('../services/sendgrid.service');
       const sendgridService = new SendGridService(prisma);
+
+      // Fold CR/LF in the caller-supplied subject (raw-HTML path only) to a single space.
+      const safeSubject = stripCrlf(String(subject));
 
       // Inject attachment indicator if data includes attachmentCount > 0
       const withAttachments = injectAttachmentIndicator(
@@ -211,7 +271,7 @@ router.post('/send', async (req: Request, res: Response) => {
         data: {
           to: Array.isArray(to) ? to.join(', ') : to,
           from: requestedFrom || 'pending-resolution',
-          subject,
+          subject: safeSubject,
           template: template || 'raw-html',
           status: 'sending',
           tenantId,
@@ -222,7 +282,7 @@ router.post('/send', async (req: Request, res: Response) => {
 
       const result = await sendgridService.sendEmail({
         to,
-        subject,
+        subject: safeSubject,
         html: withAttachments.html,
         text: withAttachments.text,
         from,
@@ -230,7 +290,7 @@ router.post('/send', async (req: Request, res: Response) => {
         replyTo,
         tenantId,
         tags: buildCategories(tags, tenantId),
-        headers,
+        headers: safeHeaders,
         attachments,
       });
 
@@ -283,7 +343,7 @@ router.post('/send', async (req: Request, res: Response) => {
       from,
       fromPrefix,
       replyTo,
-      headers,
+      headers: safeHeaders,
     });
 
     res.status(202).json({
@@ -314,6 +374,24 @@ router.post('/send/bulk', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Maximum 100 emails per bulk request' });
     }
 
+    // Reject the whole batch if ANY message has CR/LF in an address field (header-injection
+    // guard). Done before enqueuing anything so a poisoned entry cannot slip through.
+    for (let i = 0; i < emails.length; i++) {
+      const e = emails[i] || {};
+      const crlfField = firstCrlfAddressField({
+        to: e.to,
+        cc: e.cc,
+        bcc: e.bcc,
+        from: e.from,
+        replyTo: e.replyTo,
+      });
+      if (crlfField) {
+        return res
+          .status(400)
+          .json({ error: `emails[${i}].${crlfField} must not contain CR or LF characters` });
+      }
+    }
+
     const queueService: QueueService = req.app.locals.queueService;
     const results: { to: string; emailId?: string; error?: string }[] = [];
 
@@ -326,7 +404,7 @@ router.post('/send/bulk', async (req: Request, res: Response) => {
           tenantId: email.tenantId,
           from: email.from,
           replyTo: email.replyTo,
-          headers: email.headers,
+          headers: sanitizeHeaders(email.headers),
         });
         results.push({ to: email.to, emailId });
       } catch (error) {
