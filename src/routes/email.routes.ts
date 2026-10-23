@@ -5,6 +5,7 @@ import { QueueService } from '../services/queue.service';
 import { TemplateService, injectAttachmentIndicator } from '../services/template.service';
 import { WebhookService } from '../services/webhook.service';
 import { acceptsRotatableKey } from '../lib/api-key';
+import { stripSecrets } from '../lib/redact-secrets';
 
 const router = Router();
 
@@ -294,10 +295,15 @@ router.post('/send', async (req: Request, res: Response) => {
         attachments,
       });
 
+      // Raw-HTML terminal states scrub secrets out of the stored metadata (= the caller
+      // `data` map). See note below: this row is created 'sending' and so could be reloaded
+      // by the queue after a crash, which is why scrubbing is done here at the terminal
+      // transition rather than at create/write time.
+      const scrubbedMetadata = stripSecrets(data || {}) as object;
       if (!result.success) {
         await prisma.emailLog.update({
           where: { id: log.id },
-          data: { status: 'failed', error: result.error },
+          data: { status: 'failed', error: result.error, metadata: scrubbedMetadata },
         });
         return res.status(500).json({ error: result.error });
       }
@@ -309,6 +315,7 @@ router.post('/send', async (req: Request, res: Response) => {
           from: result.from || requestedFrom || 'unknown',
           sendgridMessageId: result.messageId,
           sentAt: new Date(),
+          metadata: scrubbedMetadata,
         },
       });
 
@@ -873,15 +880,23 @@ router.post('/webhooks/sendgrid', async (req: Request, res: Response) => {
       }
 
       if (newStatus) {
-        await prisma.emailLog.update({
-          where: { id: emailLog.id },
+        // delivered/bounced/complained are terminal. In practice the row was already scrubbed
+        // at send time (the webhook only matches rows that have a sendgridMessageId, i.e. that
+        // already reached 'sent'), so this is defense-in-depth and idempotent. Only write
+        // metadata when a value exists, to avoid Prisma's JsonNull/DbNull ambiguity.
+        const data: { status: 'delivered' | 'bounced' | 'complained'; error?: string; metadata?: object } = {
+          status: newStatus,
           // Record the bounded reason on the existing EmailLog.error field. No dedicated
           // field exists for the structured sgType/SMTP-status detail (see schema note),
           // so that is forwarded to PSA only — recording it here would require a migration.
-          data: {
-            status: newStatus,
-            error: detail.reason,
-          },
+          error: detail.reason,
+        };
+        if (emailLog.metadata != null) {
+          data.metadata = stripSecrets(emailLog.metadata) as object;
+        }
+        await prisma.emailLog.update({
+          where: { id: emailLog.id },
+          data,
         });
         console.log(`SendGrid webhook: email ${emailLog.id} status updated to ${newStatus}`);
       }

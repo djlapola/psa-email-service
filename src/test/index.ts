@@ -11,3 +11,4 @@ import '../services/sendgrid.service.test';
 import '../services/queue.service.test';
 import '../routes/email.routes.test';
 import './render-template-string.test';
+import './redact-secrets.test';

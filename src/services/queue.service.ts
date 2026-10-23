@@ -2,6 +2,7 @@ import { PrismaClient } from '@prisma/client';
 import { SendGridService } from './sendgrid.service';
 import { WebhookService } from './webhook.service';
 import { TemplateService, injectAttachmentIndicator } from './template.service';
+import { stripSecrets } from '../lib/redact-secrets';
 
 export interface QueuedEmail {
   id: string;
@@ -181,12 +182,21 @@ export class QueueService {
     });
 
     if (result.success) {
+      // Terminal state: scrub secrets (e.g. welcome tempPassword) out of the persisted
+      // metadata. The row will not be reloaded (loadPendingEmails takes only queued/sending),
+      // so no future render needs the cleartext values. Rebuild the exact stored shape
+      // (data + the reserved __headers key) so headers are preserved through the scrub.
+      const persistedMetadata =
+        email.headers && Object.keys(email.headers).length > 0
+          ? { ...email.data, [HEADERS_META_KEY]: email.headers }
+          : email.data;
       await this.prisma.emailLog.update({
         where: { id: email.id },
         data: {
           status: 'sent',
           sendgridMessageId: result.messageId,
           sentAt: new Date(),
+          metadata: stripSecrets(persistedMetadata) as object,
           ...(result.from && { from: result.from }),
         },
       });
@@ -228,10 +238,22 @@ export class QueueService {
    * Mark email as permanently failed
    */
   private async markFailed(id: string, error: string): Promise<void> {
-    await this.prisma.emailLog.update({
+    // Terminal state: scrub secrets out of the persisted metadata. markFailed only has the
+    // id, so read the actual stored metadata and scrub whatever is there (covers reloaded
+    // rows whose metadata differs from any in-memory copy). Only write metadata when a
+    // value exists, to avoid Prisma's JsonNull/DbNull ambiguity on a null column.
+    const existing = await this.prisma.emailLog.findUnique({
       where: { id },
-      data: { status: 'failed', error },
+      select: { metadata: true },
     });
+    const data: { status: string; error: string; metadata?: object } = {
+      status: 'failed',
+      error,
+    };
+    if (existing?.metadata != null) {
+      data.metadata = stripSecrets(existing.metadata) as object;
+    }
+    await this.prisma.emailLog.update({ where: { id }, data });
     console.error(`Email permanently failed: ${id} - ${error}`);
   }
 
