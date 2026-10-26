@@ -505,26 +505,16 @@ If you have any questions, simply reply to this email.`,
         <p>Hi {{adminFirstName}},</p>
         <p>Great news — <strong>{{companyName}}</strong> has been set up and your account is ready to use.</p>
 
-        <div class="info-box info-box-blue">
-          <table class="info-table">
-            <tr><td class="label">Company</td><td class="value">{{companyName}}</td></tr>
-            <tr><td class="label">Login URL</td><td class="value"><a href="{{loginUrl}}">{{loginUrl}}</a></td></tr>
-            <tr><td class="label">Email</td><td class="value">{{adminEmail}}</td></tr>
-            <tr><td class="label">Temporary Password</td><td class="value" style="font-family: monospace; background-color: #f3f4f6; padding: 4px 8px; border-radius: 4px;">{{tempPassword}}</td></tr>
-          </table>
-        </div>
-
         <div class="info-box info-box-yellow">
-          <p style="margin: 0;"><strong>Important:</strong> You must change your password on first login. You will be prompted automatically.</p>
+          <p style="margin: 0;">The administrator account, {{adminEmail}}, will receive a separate email with a link to set a password. The link expires in 72 hours.</p>
         </div>
 
         <div class="btn-wrap">
-          <a href="{{loginUrl}}" class="btn">Log In Now</a>
+          <a href="{{loginUrl}}" class="btn">Go to Skyrack</a>
         </div>
 
         <h2 style="font-size: 16px; margin-top: 32px;">Quick Start Tips</h2>
         <ul style="padding-left: 20px; margin: 0 0 16px 0;">
-          <li style="margin-bottom: 8px;">Change your password immediately after logging in</li>
           <li style="margin-bottom: 8px;">Set up two-factor authentication for added security</li>
           <li style="margin-bottom: 8px;">Invite your team members from the Users section</li>
           <li style="margin-bottom: 8px;">Configure your company settings and branding</li>
@@ -539,15 +529,11 @@ Hi {{adminFirstName}},
 
 Great news — {{companyName}} has been set up and your account is ready to use.
 
-Company: {{companyName}}
-Login URL: {{loginUrl}}
-Email: {{adminEmail}}
-Temporary Password: {{tempPassword}}
+The administrator account, {{adminEmail}}, will receive a separate email with a link to set a password. The link expires in 72 hours.
 
-IMPORTANT: You must change your password on first login. You will be prompted automatically.
+Go to Skyrack: {{loginUrl}}
 
 Quick Start Tips:
-- Change your password immediately after logging in
 - Set up two-factor authentication for added security
 - Invite your team members from the Users section
 - Configure your company settings and branding
@@ -558,7 +544,6 @@ If you have any questions or need help getting started, don't hesitate to reach 
       { name: 'companyName', description: 'Tenant company name', example: 'Acme Corp' },
       { name: 'loginUrl', description: 'Tenant login URL', example: 'https://acme.skyrack.com' },
       { name: 'adminEmail', description: 'Admin user email address', example: 'admin@acme.com' },
-      { name: 'tempPassword', description: 'Temporary password for first login', example: 'Xk9#mP2$vL5nQ8' },
       { name: 'adminFirstName', description: 'Admin first name', example: 'John' },
     ],
   },
@@ -570,44 +555,45 @@ If you have any questions or need help getting started, don't hesitate to reach 
     htmlBody: wrapTemplate(`
         <h2>Welcome to Skyrack Control Plane</h2>
         <p>Hi {{firstName}},</p>
-        <p>An operator account has been created for you on the Skyrack Control Plane. You can now log in and start managing tenants.</p>
+        <p>An operator account has been created for you on the Skyrack Control Plane. To get started, set your password using the button below.</p>
 
         <div class="info-box info-box-blue">
           <table class="info-table">
             <tr><td class="label">Control Plane</td><td class="value"><a href="{{cpUrl}}">{{cpUrl}}</a></td></tr>
             <tr><td class="label">Email</td><td class="value">{{operatorEmail}}</td></tr>
-            <tr><td class="label">Temporary Password</td><td class="value" style="font-family: monospace; background-color: #f3f4f6; padding: 4px 8px; border-radius: 4px;">{{tempPassword}}</td></tr>
           </table>
         </div>
 
-        <div class="info-box info-box-yellow">
-          <p style="margin: 0;"><strong>Important:</strong> You must change your password on first login. You will be prompted automatically.</p>
-        </div>
-
         <div class="btn-wrap">
-          <a href="{{cpUrl}}" class="btn">Log In to Control Plane</a>
+          <a href="{{setPasswordUrl}}" class="btn">Set Your Password</a>
         </div>
 
-        <p>After logging in, we recommend setting up two-factor authentication (2FA) right away to secure your account.</p>
+        <div class="info-box info-box-yellow">
+          <p style="margin: 0;">This link expires in {{expiresIn}}. If it expires, ask another operator to send a new one.</p>
+        </div>
+
+        <p>After setting your password and logging in, we recommend setting up two-factor authentication (2FA) right away to secure your account.</p>
     `, 'Skyrack Control Plane'),
     textBody: `Welcome to Skyrack Control Plane
 
 Hi {{firstName}},
 
-An operator account has been created for you on the Skyrack Control Plane. You can now log in and start managing tenants.
+An operator account has been created for you on the Skyrack Control Plane. To get started, set your password using the link below.
 
 Control Plane: {{cpUrl}}
 Email: {{operatorEmail}}
-Temporary Password: {{tempPassword}}
 
-IMPORTANT: You must change your password on first login. You will be prompted automatically.
+Set your password: {{setPasswordUrl}}
 
-After logging in, we recommend setting up two-factor authentication (2FA) right away to secure your account.`,
+This link expires in {{expiresIn}}. If it expires, ask another operator to send a new one.
+
+After setting your password and logging in, we recommend setting up two-factor authentication (2FA) right away to secure your account.`,
     variables: [
       { name: 'cpUrl', description: 'Control Plane URL', example: 'https://control.skyrack.com' },
       { name: 'operatorEmail', description: 'Operator email address', example: 'jane@skyrack.com' },
-      { name: 'tempPassword', description: 'Temporary password for first login', example: 'Xk9#mP2$vL5nQ8' },
       { name: 'firstName', description: 'Operator first name', example: 'Jane' },
+      { name: 'setPasswordUrl', description: 'One-time link for the operator to set their password', example: 'https://control.skyrack.com/set-password#token=abc123' },
+      { name: 'expiresIn', description: 'How long until the set-password link expires', example: '72 hours' },
     ],
   },
 

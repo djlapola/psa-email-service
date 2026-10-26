@@ -46,6 +46,35 @@ test('a substituted value containing {{y}} is NOT re-expanded (single pass)', ()
   assert.ok(!out.includes('SECRET'));
 });
 
+// --- *Url variable validation in html mode ----------------------------------
+
+test('html mode: a *Url variable with a javascript: scheme renders empty', () => {
+  assert.equal(renderTemplateString('[{{setPasswordUrl}}]', { setPasswordUrl: 'javascript:alert(1)' }, 'html'), '[]');
+});
+
+test('html mode: a *Url variable with a data: scheme renders empty', () => {
+  assert.equal(renderTemplateString('[{{setPasswordUrl}}]', { setPasswordUrl: 'data:text/html,<script>alert(1)</script>' }, 'html'), '[]');
+});
+
+test('html mode: a *Url variable with a relative path renders empty', () => {
+  assert.equal(renderTemplateString('[{{setPasswordUrl}}]', { setPasswordUrl: '/relative/path' }, 'html'), '[]');
+});
+
+test('html mode: a *Url variable with http:// or https:// is kept', () => {
+  assert.equal(renderTemplateString('{{setPasswordUrl}}', { setPasswordUrl: 'http://host/set' }, 'html'), 'http://host/set');
+  assert.equal(renderTemplateString('{{setPasswordUrl}}', { setPasswordUrl: 'https://host/set' }, 'html'), 'https://host/set');
+});
+
+test('html mode: an https *Url with a #token= fragment survives unchanged', () => {
+  const url = 'https://host/set-password#token=abc123';
+  assert.equal(renderTemplateString('<a href="{{setPasswordUrl}}">x</a>', { setPasswordUrl: url }, 'html'), `<a href="${url}">x</a>`);
+});
+
+test('html mode: a non-Url key containing "javascript:" is escaped as normal, not blanked', () => {
+  // `note` does not end in "Url", so the URL gate does not apply; it is escaped like any value.
+  assert.equal(renderTemplateString('{{note}}', { note: 'javascript:alert(1)' }, 'html'), 'javascript:alert(1)');
+});
+
 // --- {{#if}} conditionals (unchanged behaviour) -----------------------------
 
 test('{{#if}} includes content when the flag is truthy', () => {

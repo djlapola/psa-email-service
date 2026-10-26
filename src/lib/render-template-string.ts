@@ -14,6 +14,23 @@ export type RenderMode = 'html' | 'subject' | 'text';
 export const TRUSTED_HTML_VARS: ReadonlySet<string> = new Set<string>([]);
 
 /**
+ * True only for a syntactically valid absolute http(s) URL. Used to gate any variable
+ * whose name ends in "Url" before it is placed in an HTML `href`: a value that is not a
+ * real http/https URL (e.g. `javascript:…`, `data:…`, a relative `/path`, or garbage)
+ * renders as the empty string instead, so it can never introduce an active scheme or a
+ * broken relative link into the output. Mirrors the check `injectAttachmentIndicator`
+ * already applies to `portalTicketUrl`.
+ */
+function isHttpUrl(s: string): boolean {
+  try {
+    const parsed = new URL(s);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Pure, single-pass renderer for the `{{var}}` + `{{#if var}}...{{/if}}` mini-language.
  *
  * Single-pass semantics are load-bearing for safety: the `{{#if}}` pass runs first
@@ -62,8 +79,14 @@ export function renderTemplateString(
     }
     const v = String(value);
     switch (mode) {
-      case 'html':
-        return TRUSTED_HTML_VARS.has(varName) ? v : escapeHtml(v);
+      case 'html': {
+        if (TRUSTED_HTML_VARS.has(varName)) return v;
+        // Any variable whose name ends in "Url" must be a valid absolute http(s) URL,
+        // otherwise it renders empty (never a `javascript:`/`data:`/relative value in an
+        // href). Then escape as normal — `#`, `=`, `?` survive; `&` becomes `&amp;`.
+        if (/Url$/.test(varName) && !isHttpUrl(v)) return '';
+        return escapeHtml(v);
+      }
       case 'subject':
         return v.replace(/[\r\n]+/g, ' ');
       case 'text':
