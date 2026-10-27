@@ -599,59 +599,6 @@ After setting your password and logging in, we recommend setting up two-factor a
 
   // ============ PLATFORM TEMPLATES ============
   {
-    name: 'welcome',
-    displayName: 'Welcome Email',
-    description: 'Sent to new users when their account is created',
-    subject: 'Welcome to {{companyName}}!',
-    htmlBody: wrapTemplate(`
-        <h2>Welcome to {{companyName}}!</h2>
-        <p>Hi {{userName}},</p>
-        <p>Your account has been created and you're all set to get started.</p>
-
-        <div class="info-box info-box-blue">
-          <table class="info-table">
-            <tr><td class="label">Email</td><td class="value">{{userEmail}}</td></tr>
-            {{#if temporaryPassword}}
-            <tr><td class="label">Temporary Password</td><td class="value" style="font-family: monospace;">{{temporaryPassword}}</td></tr>
-            {{/if}}
-          </table>
-        </div>
-
-        {{#if temporaryPassword}}
-        <p style="color: #dc2626;"><strong>Important:</strong> Please change your password after your first login.</p>
-        {{/if}}
-
-        <div class="btn-wrap">
-          <a href="{{loginUrl}}" class="btn">Login to Your Account</a>
-        </div>
-
-        <p>If you have any questions or need help getting started, don't hesitate to reach out to our support team.</p>
-    `),
-    textBody: `Welcome to {{companyName}}!
-
-Hi {{userName}},
-
-Your account has been created and you're all set to get started.
-
-Email: {{userEmail}}
-{{#if temporaryPassword}}
-Temporary Password: {{temporaryPassword}}
-
-Important: Please change your password after your first login.
-{{/if}}
-
-Login to your account: {{loginUrl}}
-
-If you have any questions or need help getting started, don't hesitate to reach out to our support team.`,
-    variables: [
-      { name: 'userName', description: 'Name of the new user', example: 'John Smith' },
-      { name: 'userEmail', description: 'Email address of the user', example: 'john@example.com' },
-      { name: 'temporaryPassword', description: 'Temporary password (optional)', example: 'TempPass123!' },
-      { name: 'loginUrl', description: 'URL to login page', example: 'https://app.example.com/login' },
-      { name: 'companyName', description: 'Company/MSP name', example: 'Acme IT Support' },
-    ],
-  },
-  {
     name: 'password-reset',
     displayName: 'Password Reset',
     description: 'Sent when a user requests a password reset',
