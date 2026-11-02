@@ -22,6 +22,11 @@ interface InboundEmail {
     to?: string[];
     from?: string;
   };
+  // SendGrid sender-authentication fields, forwarded verbatim to PSA so it can
+  // decide whether a staff reply is genuinely from that person. These are the raw
+  // SendGrid Inbound Parse `SPF`/`dkim` form fields.
+  spf?: string;
+  dkim?: string;
   // ISO timestamp stamped by the route when SendGrid delivered the webhook.
   receivedAt?: string;
 }
@@ -59,6 +64,21 @@ export interface PsaInboundAttachment {
   fileSize: number;
 }
 
+/**
+ * Sender-authentication data forwarded to PSA. PSA uses this to decide whether an
+ * inbound staff reply genuinely came from that person (authenticated -> public
+ * reply; unverified/missing -> internal note). Every field except `source` is
+ * omitted when it can't be determined; never fabricate a verdict. We deliberately
+ * do NOT forward Authentication-Results headers: SendGrid does not stamp its own,
+ * so any such header is sender-controllable and PSA ignores it.
+ */
+export interface PsaInboundAuth {
+  spf?: string;
+  dkim?: string;
+  envelopeFrom?: string;
+  source: 'sendgrid';
+}
+
 export interface PsaInboundPayload {
   tenantId: string;
   tenantSubdomain: string;
@@ -76,6 +96,7 @@ export interface PsaInboundPayload {
   xAutoreply: string | null;
   receivedAt: string;
   attachments: PsaInboundAttachment[];
+  auth: PsaInboundAuth;
 }
 
 /**
@@ -111,6 +132,22 @@ export function extractAddresses(raw?: string): string[] {
 
 function dedupe(arr: string[]): string[] {
   return Array.from(new Set(arr));
+}
+
+/**
+ * Build the optional `auth` object relayed to PSA from the SendGrid sender-
+ * authentication fields. Purely additive: `spf`/`dkim`/`envelopeFrom` are each
+ * included only when present (verbatim), so PSA can tell "missing" from a real
+ * verdict; `source` is always 'sendgrid'. Never throws — a bad/missing field is
+ * simply omitted.
+ */
+export function buildAuthObject(email: InboundEmail): PsaInboundAuth {
+  const auth: PsaInboundAuth = { source: 'sendgrid' };
+  if (email.spf) auth.spf = email.spf;
+  if (email.dkim) auth.dkim = email.dkim;
+  const envelopeFrom = email.envelope?.from;
+  if (envelopeFrom) auth.envelopeFrom = envelopeFrom;
+  return auth;
 }
 
 /**
@@ -167,6 +204,7 @@ export function buildPsaInboundPayload(
       contentId: a.contentId,
       fileSize: a.size || 0,
     })),
+    auth: buildAuthObject(email),
   };
 }
 

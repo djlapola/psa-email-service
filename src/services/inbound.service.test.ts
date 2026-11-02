@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   buildPsaInboundPayload,
   buildRecipients,
+  buildAuthObject,
   extractAddresses,
   classifyPsaStatus,
 } from './inbound.service';
@@ -99,6 +100,93 @@ test('buildPsaInboundPayload tolerates missing headers/attachments', () => {
   assert.equal(p.xAutoreply, null);
   assert.deepEqual(p.attachments, []);
   assert.equal(typeof p.receivedAt, 'string'); // stamped when absent
+});
+
+// ---------------------------------------------------------------------------
+// Sender-authentication relay (the `auth` object forwarded to PSA).
+//
+// Authentication-Results headers are intentionally NOT forwarded: SendGrid does
+// not stamp its own, so any such header is sender-controllable and PSA ignores it.
+// ---------------------------------------------------------------------------
+
+test('buildAuthObject: all fields present', () => {
+  const auth = buildAuthObject({
+    from: 'tech@acme.com',
+    to: 'support@deskside.skyrack.com',
+    subject: 'hi',
+    spf: 'pass',
+    dkim: '{@acme.com : pass}',
+    envelope: { to: ['support@deskside.skyrack.com'], from: 'tech@acme.com' },
+  });
+  assert.deepEqual(auth, {
+    spf: 'pass',
+    dkim: '{@acme.com : pass}',
+    envelopeFrom: 'tech@acme.com',
+    source: 'sendgrid',
+  });
+});
+
+test('buildAuthObject: envelope missing -> envelopeFrom omitted, source still present', () => {
+  const auth = buildAuthObject({
+    from: 'tech@acme.com',
+    to: 'support@deskside.skyrack.com',
+    subject: 'hi',
+    spf: 'pass',
+    // no envelope
+  });
+  assert.equal('envelopeFrom' in auth, false);
+  assert.equal(auth.spf, 'pass');
+  assert.equal('dkim' in auth, false);
+  assert.equal(auth.source, 'sendgrid');
+});
+
+test('buildAuthObject: malformed-envelope case (route yields envelope={}) -> envelopeFrom omitted', () => {
+  // The route sets envelope = {} when JSON.parse fails; the service sees no `from`.
+  const auth = buildAuthObject({
+    from: 'tech@acme.com',
+    to: 'support@deskside.skyrack.com',
+    subject: 'hi',
+    envelope: {},
+  });
+  assert.equal('envelopeFrom' in auth, false);
+  assert.equal(auth.source, 'sendgrid');
+});
+
+test('buildAuthObject: no auth data at all -> only source', () => {
+  const auth = buildAuthObject({ from: 'a@b.com', to: 'support@deskside.skyrack.com', subject: 'hi' });
+  assert.deepEqual(auth, { source: 'sendgrid' });
+});
+
+test('buildPsaInboundPayload embeds the auth object (no authenticationResults)', () => {
+  const p = buildPsaInboundPayload(
+    {
+      ...sampleEmail(),
+      spf: 'pass',
+      dkim: '{@customer.com : pass}',
+    },
+    'tenant-1',
+    'deskside',
+  );
+  assert.deepEqual(p.auth, {
+    spf: 'pass',
+    dkim: '{@customer.com : pass}',
+    envelopeFrom: 'jane@customer.com', // from sampleEmail().envelope.from
+    source: 'sendgrid',
+  });
+});
+
+test('buildPsaInboundPayload: raw-MIME mode is OFF in this handler (no email field consumed)', () => {
+  // The handler reads parsed text/html/headers, not a full-MIME `email` field, so
+  // in parsed mode SPF/dkim/envelope are forwarded as-is and bodies come through.
+  // This asserts the parsed-mode contract the service is built against.
+  const p = buildPsaInboundPayload(
+    { ...sampleEmail(), spf: 'pass', dkim: 'pass' },
+    't',
+    'deskside',
+  );
+  assert.equal(p.bodyHtml, '<p>It is still broken.</p>');
+  assert.equal(p.auth.spf, 'pass');
+  assert.equal(p.auth.source, 'sendgrid');
 });
 
 test('classifyPsaStatus maps status -> forward outcome', () => {

@@ -81,6 +81,10 @@ router.post('/sendgrid', upload.any(), async (req: Request, res: Response) => {
     }
     console.log(`[InboundRoutes:SendGrid] Total attachments: ${attachments.length}`);
 
+    // SendGrid sender-authentication fields, forwarded verbatim to PSA.
+    const spf: string | undefined = body.SPF;
+    const dkim: string | undefined = body.dkim;
+
     // Build email object matching InboundEmail interface
     const email = {
       from: body.from || envelope.from || '',
@@ -92,8 +96,16 @@ router.post('/sendgrid', upload.any(), async (req: Request, res: Response) => {
       headers: headers,
       attachments: attachments,
       envelope: envelope,
+      spf,
+      dkim,
       receivedAt,
     };
+
+    // Routing metadata only — log WHICH auth fields were present, never their values.
+    console.log(
+      `[InboundRoutes:SendGrid] Auth fields present — spf:${!!spf} dkim:${!!dkim} ` +
+        `envelopeFrom:${!!envelope.from}`,
+    );
 
     // Forward to PSA (PSA owns classification + failure tracking).
     const result = await inboundService.processInboundEmail(email);
