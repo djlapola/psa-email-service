@@ -7,7 +7,12 @@ import {
   buildAuthObject,
   extractAddresses,
   classifyPsaStatus,
+  applyAttachmentBudget,
+  MAX_ATTACHMENT_BYTES,
+  MAX_TOTAL_ATTACHMENT_BYTES,
 } from './inbound.service';
+
+const MB = 1024 * 1024;
 
 // A representative SendGrid-parsed inbound email (headers already lowercased by
 // the route's parseEmailHeaders).
@@ -187,6 +192,83 @@ test('buildPsaInboundPayload: raw-MIME mode is OFF in this handler (no email fie
   assert.equal(p.bodyHtml, '<p>It is still broken.</p>');
   assert.equal(p.auth.spf, 'pass');
   assert.equal(p.auth.source, 'sendgrid');
+});
+
+// ---------------------------------------------------------------------------
+// Attachment size budget (applied on RAW bytes before base64-encoding).
+// ---------------------------------------------------------------------------
+
+test('applyAttachmentBudget: a file over the per-file cap is skipped', () => {
+  const { kept, skipped } = applyAttachmentBudget([
+    { filename: 'big.bin', size: MAX_ATTACHMENT_BYTES + 1 },
+    { filename: 'ok.txt', size: 10 * MB },
+  ]);
+  assert.deepEqual(kept.map((k) => k.filename), ['ok.txt']);
+  assert.deepEqual(skipped, [{ filename: 'big.bin', size: MAX_ATTACHMENT_BYTES + 1, reason: 'too_large' }]);
+});
+
+test('applyAttachmentBudget: total over budget drops the LARGEST first, regardless of order', () => {
+  const { kept, skipped } = applyAttachmentBudget([
+    { filename: 'mid.bin', size: 10 * MB },
+    { filename: 'big.bin', size: 15 * MB },
+    { filename: 'small.bin', size: 5 * MB },
+  ]);
+  // total 30 MB > 22 MB budget; drop big (15 MB) -> 15 MB remains, which fits.
+  assert.deepEqual(skipped.map((s) => s.filename), ['big.bin']);
+  assert.deepEqual(kept.map((k) => k.filename), ['mid.bin', 'small.bin']);
+  assert.ok(kept.reduce((s, a) => s + a.size, 0) <= MAX_TOTAL_ATTACHMENT_BYTES);
+});
+
+test('applyAttachmentBudget: drops multiple largest files until the total fits', () => {
+  const { kept, skipped } = applyAttachmentBudget([
+    { filename: 'a.bin', size: 21 * MB },
+    { filename: 'b.bin', size: 21 * MB },
+    { filename: 'c.bin', size: 21 * MB },
+  ]);
+  // 63 MB -> drop one (42) -> drop another (21) -> fits. Two dropped, one kept.
+  assert.equal(kept.length, 1);
+  assert.equal(skipped.length, 2);
+  assert.ok(kept.reduce((s, a) => s + a.size, 0) <= MAX_TOTAL_ATTACHMENT_BYTES);
+});
+
+test('applyAttachmentBudget: a small inline image (contentId, <1 MB) is never dropped', () => {
+  const inline = { filename: 'logo.png', size: 100 * 1024, contentId: 'logo1' };
+  const big = { filename: 'dump.bin', size: 23 * MB }; // under per-file cap, but pushes total over budget
+  const { kept, skipped } = applyAttachmentBudget([inline, big]);
+  assert.deepEqual(kept.map((k) => k.filename), ['logo.png']);
+  assert.deepEqual(skipped.map((s) => s.filename), ['dump.bin']);
+});
+
+test('applyAttachmentBudget: an inline image >= 1 MB is NOT protected', () => {
+  const inline = { filename: 'huge-inline.png', size: 26 * MB, contentId: 'c1' };
+  const { kept, skipped } = applyAttachmentBudget([inline]);
+  assert.deepEqual(kept, []);
+  assert.deepEqual(skipped.map((s) => s.filename), ['huge-inline.png']);
+});
+
+test('applyAttachmentBudget: within budget keeps everything, skips nothing', () => {
+  const { kept, skipped } = applyAttachmentBudget([
+    { filename: 'a.txt', size: 5 * MB },
+    { filename: 'b.txt', size: 5 * MB },
+  ]);
+  assert.equal(kept.length, 2);
+  assert.deepEqual(skipped, []);
+});
+
+test('buildPsaInboundPayload omits skippedAttachments when none were dropped', () => {
+  const p = buildPsaInboundPayload(sampleEmail(), 't', 'deskside');
+  assert.equal('skippedAttachments' in p, false);
+});
+
+test('buildPsaInboundPayload omits skippedAttachments when the array is empty', () => {
+  const p = buildPsaInboundPayload({ ...sampleEmail(), skippedAttachments: [] }, 't', 'deskside');
+  assert.equal('skippedAttachments' in p, false);
+});
+
+test('buildPsaInboundPayload includes skippedAttachments when present', () => {
+  const dropped = [{ filename: 'big.bin', size: 30 * MB, reason: 'too_large' as const }];
+  const p = buildPsaInboundPayload({ ...sampleEmail(), skippedAttachments: dropped }, 't', 'deskside');
+  assert.deepEqual(p.skippedAttachments, dropped);
 });
 
 test('classifyPsaStatus maps status -> forward outcome', () => {

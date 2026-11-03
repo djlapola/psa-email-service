@@ -27,6 +27,9 @@ interface InboundEmail {
   // SendGrid Inbound Parse `SPF`/`dkim` form fields.
   spf?: string;
   dkim?: string;
+  // Attachments the route dropped for exceeding the size budget (populated before
+  // base64-encoding the kept ones). Forwarded to PSA so it can note them.
+  skippedAttachments?: SkippedAttachment[];
   // ISO timestamp stamped by the route when SendGrid delivered the webhook.
   receivedAt?: string;
 }
@@ -65,6 +68,25 @@ export interface PsaInboundAttachment {
 }
 
 /**
+ * Attachment size budget (RAW bytes, before base64 expansion). PSA's inbound
+ * route accepts up to 32 MiB of JSON (Cloud Run's HTTP/1.1 ceiling); base64
+ * inflates bytes by ~33%, so we cap the raw total well under that. Files over the
+ * budget are dropped and reported to PSA in `skippedAttachments` rather than
+ * blowing the request past the ceiling (which PSA would 413).
+ */
+export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024; // per single file
+export const MAX_TOTAL_ATTACHMENT_BYTES = 22 * 1024 * 1024; // raw total across one email
+/** Inline images (contentId) under this size are always kept so bodies don't break. */
+const INLINE_KEEP_MAX_BYTES = 1 * 1024 * 1024;
+
+/** An attachment the relay dropped for exceeding the size budget. Forwarded to PSA. */
+export interface SkippedAttachment {
+  filename: string;
+  size: number; // raw bytes
+  reason: 'too_large';
+}
+
+/**
  * Sender-authentication data forwarded to PSA. PSA uses this to decide whether an
  * inbound staff reply genuinely came from that person (authenticated -> public
  * reply; unverified/missing -> internal note). Every field except `source` is
@@ -96,6 +118,7 @@ export interface PsaInboundPayload {
   xAutoreply: string | null;
   receivedAt: string;
   attachments: PsaInboundAttachment[];
+  skippedAttachments?: SkippedAttachment[];
   auth: PsaInboundAuth;
 }
 
@@ -132,6 +155,49 @@ export function extractAddresses(raw?: string): string[] {
 
 function dedupe(arr: string[]): string[] {
   return Array.from(new Set(arr));
+}
+
+/**
+ * Apply the attachment size budget to a list of attachments, operating on RAW
+ * byte sizes (call this BEFORE base64-encoding so dropped files are never
+ * encoded or forwarded). Rules:
+ *   1. Any file over MAX_ATTACHMENT_BYTES is dropped.
+ *   2. While the kept raw total still exceeds MAX_TOTAL_ATTACHMENT_BYTES, drop
+ *      the LARGEST remaining file, one at a time, until it fits.
+ *   3. A file that is under INLINE_KEEP_MAX_BYTES AND has a contentId (an inline
+ *      image) is NEVER dropped, so message bodies that reference it don't break.
+ * Returns the kept attachments (input order preserved) and a `skipped` record for
+ * each dropped file. Pure; never throws.
+ */
+export function applyAttachmentBudget<T extends { filename: string; size: number; contentId?: string }>(
+  attachments: T[],
+): { kept: T[]; skipped: SkippedAttachment[] } {
+  const skipped: SkippedAttachment[] = [];
+  const isProtectedInline = (a: T) => !!a.contentId && a.size < INLINE_KEEP_MAX_BYTES;
+
+  // Pass 1: per-file cap. (A protected inline image is < 1 MB so it can never
+  // exceed the 25 MB cap, but we guard explicitly for clarity.)
+  let kept: T[] = [];
+  for (const a of attachments) {
+    if (a.size > MAX_ATTACHMENT_BYTES && !isProtectedInline(a)) {
+      skipped.push({ filename: a.filename, size: a.size, reason: 'too_large' });
+    } else {
+      kept.push(a);
+    }
+  }
+
+  // Pass 2: total budget — drop the largest droppable file until the raw total fits.
+  const rawTotal = (list: T[]) => list.reduce((sum, a) => sum + a.size, 0);
+  while (rawTotal(kept) > MAX_TOTAL_ATTACHMENT_BYTES) {
+    const droppable = kept.filter((a) => !isProtectedInline(a));
+    if (droppable.length === 0) break; // only protected inline images remain
+    let largest = droppable[0];
+    for (const a of droppable) if (a.size > largest.size) largest = a;
+    kept = kept.filter((a) => a !== largest);
+    skipped.push({ filename: largest.filename, size: largest.size, reason: 'too_large' });
+  }
+
+  return { kept, skipped };
 }
 
 /**
@@ -181,7 +247,7 @@ export function buildPsaInboundPayload(
     .split(/\s+/)
     .filter(Boolean);
 
-  return {
+  const payload: PsaInboundPayload = {
     tenantId,
     tenantSubdomain,
     fromEmail,
@@ -206,6 +272,13 @@ export function buildPsaInboundPayload(
     })),
     auth: buildAuthObject(email),
   };
+
+  // Only include skippedAttachments when at least one was dropped.
+  if (email.skippedAttachments && email.skippedAttachments.length > 0) {
+    payload.skippedAttachments = email.skippedAttachments;
+  }
+
+  return payload;
 }
 
 /**
@@ -234,45 +307,6 @@ class InboundService {
   constructor(prisma: PrismaClient) {
     this.prisma = prisma;
     this.baseDomain = process.env.BASE_DOMAIN || 'skyrack.com';
-  }
-
-  /**
-   * Strip quoted reply text from email body
-   * Removes content after common quote indicators like "On ... wrote:" or lines starting with ">"
-   */
-  private stripQuotedText(text: string): string {
-    if (!text) return '';
-
-    // Split into lines
-    const lines = text.split('\n');
-    const cleanLines: string[] = [];
-
-    for (const line of lines) {
-      // Stop at "On ... wrote:" pattern (Gmail, Apple Mail)
-      if (/^On .+ wrote:$/i.test(line.trim())) {
-        break;
-      }
-
-      // Stop at "From:" header pattern (Outlook)
-      if (/^From:\s*.+/i.test(line.trim())) {
-        break;
-      }
-
-      // Stop at separator lines (common in many clients)
-      if (/^-{3,}/.test(line.trim()) || /^_{3,}/.test(line.trim())) {
-        break;
-      }
-
-      // Skip lines that start with ">" (quoted text)
-      if (line.trim().startsWith('>')) {
-        continue;
-      }
-
-      cleanLines.push(line);
-    }
-
-    // Trim trailing whitespace and return
-    return cleanLines.join('\n').trim();
   }
 
   /**
@@ -320,16 +354,16 @@ class InboundService {
   }
 
   // =========================================================================
-  // DEPRECATED — local classification (unused as of the thin-forwarder change).
+  // DEPRECATED — local ticket matching (unused as of the thin-forwarder change).
   //
   // PSA now owns reply-vs-new-ticket classification. The methods below
   // (matchEmailToTicket, findTicketByMessageId, parseTicketIdFromText,
-  // findTicketByNumber, storeMessageId, createTicketFromEmail,
-  // addCommentToTicket, getAdditionalRecipients, stripQuotedText) are no longer
-  // called by processInboundEmail. They are retained for one release so the
-  // change is a pure routing swap and easy to revert; they can be deleted — see
-  // the report's "dead code" list. Nothing in the inbound path reads or writes
-  // the EmailMessageId table anymore.
+  // findTicketByNumber) are no longer called by processInboundEmail; they are
+  // retained for one release so the change is easy to revert. The PSA write-path
+  // methods (createTicketFromEmail, addCommentToTicket) and their helpers
+  // (storeMessageId, extractEmailAddress, getAdditionalRecipients,
+  // stripQuotedText) have been removed. Nothing in the inbound path reads or
+  // writes the EmailMessageId table anymore.
   // =========================================================================
 
   /**
@@ -449,76 +483,6 @@ class InboundService {
   }
 
   /**
-   * Store a Message-ID for future ticket matching
-   */
-  async storeMessageId(tenantId: string, ticketId: string, messageId: string, commentId?: string): Promise<void> {
-    // Clean the message ID
-    const cleanMessageId = messageId.replace(/^<|>$/g, '').trim();
-
-    await this.prisma.emailMessageId.create({
-      data: {
-        tenantId,
-        ticketId,
-        commentId: commentId || null,
-        messageId: cleanMessageId,
-      },
-    });
-
-    console.log(`[InboundService] Stored Message-ID: ${cleanMessageId} for ticket ${ticketId}`);
-  }
-
-  /**
-   * Extract just the email address from a "From" field
-   * Handles formats like: "Name <email@example.com>" or just "email@example.com"
-   */
-  private extractEmailAddress(from: string): string {
-    const match = from.match(/<([^>]+)>/);
-    if (match) {
-      return match[1].toLowerCase();
-    }
-    // If no angle brackets, assume it's just the email
-    return from.trim().toLowerCase();
-  }
-
-  /**
-   * Extract additional recipients (TO excluding support@, plus all CC) for watcher handling
-   * Always parses the TO header since envelope.to only contains the address SendGrid received for
-   */
-  private getAdditionalRecipients(email: InboundEmail, subdomain: string): string {
-    console.log(`[InboundService] getAdditionalRecipients - to: "${email.to}", cc: "${email.cc}", envelope: ${JSON.stringify(email.envelope)}, subdomain: "${subdomain}"`);
-    const supportEmail = `support@${subdomain}.${this.baseDomain}`.toLowerCase();
-    const recipients: string[] = [];
-
-    // Always parse TO header - it contains ALL recipients
-    // (envelope.to only contains the address SendGrid actually received for)
-    if (email.to) {
-      const toAddresses = email.to.split(',').map(e => e.trim()).filter(Boolean);
-      for (const addr of toAddresses) {
-        const emailMatch = addr.match(/<([^>]+)>/);
-        const emailAddr = (emailMatch ? emailMatch[1] : addr).trim().toLowerCase();
-        if (emailAddr && emailAddr !== supportEmail && !recipients.includes(emailAddr)) {
-          recipients.push(emailAddr);
-        }
-      }
-    }
-
-    // Add all CC addresses
-    if (email.cc) {
-      const ccAddresses = email.cc.split(',').map(e => e.trim()).filter(Boolean);
-      for (const addr of ccAddresses) {
-        const emailMatch = addr.match(/<([^>]+)>/);
-        const emailAddr = (emailMatch ? emailMatch[1] : addr).trim().toLowerCase();
-        if (emailAddr && !recipients.includes(emailAddr)) {
-          recipients.push(emailAddr);
-        }
-      }
-    }
-
-    console.log(`[InboundService] Final additionalRecipients: "${recipients.join(', ')}"`);
-    return recipients.join(', ');
-  }
-
-  /**
    * Resolve the tenant subdomain from the mail's recipients. Prefers the SMTP
    * envelope recipients (the address SendGrid actually received for), then the
    * To header, and returns the first address under the base domain.
@@ -559,6 +523,7 @@ class InboundService {
   private async forwardToPsa(payload: PsaInboundPayload): Promise<ForwardResult> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), PSA_FORWARD_TIMEOUT_MS);
+    const body = JSON.stringify(payload);
     try {
       const response = await fetch(`${PSA_INTERNAL_API_URL}/inbound/email`, {
         method: 'POST',
@@ -567,9 +532,19 @@ class InboundService {
           [PSA_API_KEY_HEADER]: psaApiKey(),
           'X-Tenant-Id': payload.tenantId,
         },
-        body: JSON.stringify(payload),
+        body,
         signal: controller.signal,
       });
+      if (response.status === 413) {
+        // Attachments were already size-budgeted, so a 413 is unexpected and
+        // retrying the same payload won't help — log loudly (metadata only, no
+        // body/attachment content) but still classify as client-error (200 ack).
+        console.error(
+          `[InboundService] PSA returned 413 Payload Too Large — tenant=${payload.tenantId} ` +
+            `messageId=${payload.messageId || '(none)'} payloadBytes=${Buffer.byteLength(body)}. ` +
+            `Acknowledging to SendGrid; retry would not help.`,
+        );
+      }
       return classifyPsaStatus(response.status);
     } catch (error: any) {
       if (error?.name === 'AbortError') return { kind: 'timeout' };
@@ -579,110 +554,6 @@ class InboundService {
     }
   }
 
-  /**
-   * Create a new ticket from an inbound email
-   */
-  private async createTicketFromEmail(email: InboundEmail, tenantId: string, subdomain: string): Promise<{ success: boolean; ticketId?: string; isNew?: boolean; error?: string }> {
-    try {
-      console.log(`[InboundService] Creating new ticket for tenant: ${tenantId}`);
-
-      const response = await fetch(`${PSA_INTERNAL_API_URL}/tickets/from-email`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          [PSA_API_KEY_HEADER]: psaApiKey(),
-          'X-Tenant-Id': tenantId,
-        },
-        body: JSON.stringify({
-          tenantSubdomain: subdomain,
-          fromEmail: this.extractEmailAddress(email.from),
-          fromName: email.from.replace(/<.*>/, "").trim().replace(/^["']|["']$/g, '') || this.extractEmailAddress(email.from),
-          toEmail: email.to,
-          additionalRecipients: this.getAdditionalRecipients(email, subdomain),
-          subject: email.subject || "No Subject",
-          bodyText: this.stripQuotedText(email.text || ""),
-          bodyHtml: this.stripQuotedText(email.html || ""),
-          messageId: email.headers?.["message-id"] || email.headers?.["Message-ID"] || "",
-          inReplyTo: email.headers?.["in-reply-to"] || email.headers?.["In-Reply-To"] || null,
-          references: (email.headers?.["references"] || email.headers?.["References"] || "").split(/\s+/).filter(Boolean),
-          attachments: (email.attachments || []).map(a => ({ filename: a.filename, content: a.content, mimeType: a.contentType, contentId: a.contentId, fileSize: a.size || 0 })),
-        }),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error(`[InboundService] PSA create ticket error: ${response.status} ${errorText}`);
-        return { success: false, error: `PSA error: ${response.status}` };
-      }
-
-      const result = await response.json() as { ticketId?: string; id?: string };
-      const ticketId = result.ticketId || result.id;
-
-      console.log(`[InboundService] Created ticket: ${ticketId}`);
-
-      // Store the Message-ID for future matching
-      const messageId = email.headers?.['message-id'] || email.headers?.['Message-ID'];
-      if (messageId && ticketId) {
-        await this.storeMessageId(tenantId, ticketId, messageId);
-      }
-
-      return { success: true, ticketId, isNew: true };
-    } catch (error: any) {
-      console.error(`[InboundService] Create ticket error:`, error);
-      return { success: false, error: error.message };
-    }
-  }
-
-  /**
-   * Add a comment to an existing ticket
-   */
-  private async addCommentToTicket(email: InboundEmail, ticketId: string, tenantId: string, subdomain: string): Promise<{ success: boolean; ticketId?: string; isNew?: boolean; error?: string }> {
-    try {
-      console.log(`[InboundService] Adding comment to ticket: ${ticketId}`);
-
-      const response = await fetch(`${PSA_INTERNAL_API_URL}/tickets/${ticketId}/comments/from-email`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          [PSA_API_KEY_HEADER]: psaApiKey(),
-          'X-Tenant-Id': tenantId,
-        },
-        body: JSON.stringify({
-          tenantId,
-          tenantSubdomain: subdomain,
-          fromEmail: this.extractEmailAddress(email.from),
-          fromName: email.from.replace(/<.*>/, "").trim().replace(/^["']|["']$/g, '') || this.extractEmailAddress(email.from),
-          additionalRecipients: this.getAdditionalRecipients(email, subdomain),
-          bodyText: this.stripQuotedText(email.text || ""),
-          bodyHtml: this.stripQuotedText(email.html || ""),
-          messageId: email.headers?.["message-id"] || email.headers?.["Message-ID"] || "",
-          attachments: (email.attachments || []).map(a => ({ filename: a.filename, content: a.content, mimeType: a.contentType, contentId: a.contentId, fileSize: a.size || 0 })),
-        }),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error(`[InboundService] PSA add comment error: ${response.status} ${errorText}`);
-        return { success: false, error: `PSA error: ${response.status}` };
-      }
-
-      const result = await response.json() as { commentId?: string; id?: string };
-      const commentId = result.commentId || result.id;
-
-      console.log(`[InboundService] Added comment to ticket: ${ticketId}`);
-
-      // Store the Message-ID for future matching
-      const messageId = email.headers?.['message-id'] || email.headers?.['Message-ID'];
-      if (messageId) {
-        await this.storeMessageId(tenantId, ticketId, messageId, commentId);
-      }
-
-      return { success: true, ticketId, isNew: false };
-    } catch (error: any) {
-      console.error(`[InboundService] Add comment error:`, error);
-      return { success: false, error: error.message };
-    }
-  }
 }
 
 export function createInboundService(prisma: PrismaClient): InboundService {

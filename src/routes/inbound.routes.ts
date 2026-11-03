@@ -1,11 +1,45 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import { PrismaClient } from '@prisma/client';
-import { createInboundService } from '../services/inbound.service';
+import {
+  createInboundService,
+  applyAttachmentBudget,
+  MAX_ATTACHMENT_BYTES,
+  MAX_TOTAL_ATTACHMENT_BYTES,
+} from '../services/inbound.service';
 import { PSA_API_KEY_HEADER } from '../lib/psa-auth';
 import multer from 'multer';
 
 const router = Router();
-const upload = multer();
+// fileSize is set ABOVE our 25 MB per-file budget so oversize files are recorded
+// in skippedAttachments rather than rejected outright by multer; `files` is a sane
+// hard cap. A breach of either surfaces as a MulterError (see handleUpload).
+const upload = multer({
+  limits: {
+    fileSize: 35 * 1024 * 1024,
+    files: 100,
+  },
+});
+
+/**
+ * Run multer's multipart parser and convert ANY failure (LIMIT_FILE_SIZE,
+ * LIMIT_FILE_COUNT, or a malformed-multipart parse error) into a loud 503 so
+ * SendGrid retries. Without this, a MulterError would bubble to the generic
+ * Express error handler; routing it here guarantees it is never a silent 200 and
+ * is logged with the specific limit that tripped.
+ */
+function handleUpload(req: Request, res: Response, next: NextFunction): void {
+  upload.any()(req, res, (err: any) => {
+    if (err) {
+      console.error(
+        `[InboundRoutes:SendGrid] Multipart rejected by multer (${err?.code || err?.name || 'error'}): ` +
+          `${err?.message}. Returning 503 so SendGrid retries rather than silently dropping the mail.`,
+      );
+      res.status(503).send('Attachment limits exceeded');
+      return;
+    }
+    next();
+  });
+}
 
 /**
  * POST /api/inbound/sendgrid
@@ -23,7 +57,7 @@ const upload = multer();
  * - attachments: number of attachments
  * - attachment1, attachment2, etc: attachment files
  */
-router.post('/sendgrid', upload.any(), async (req: Request, res: Response) => {
+router.post('/sendgrid', handleUpload, async (req: Request, res: Response) => {
   try {
     const prisma: PrismaClient = req.app.locals.prisma;
     const inboundService = createInboundService(prisma);
@@ -47,8 +81,9 @@ router.post('/sendgrid', upload.any(), async (req: Request, res: Response) => {
     // Parse headers if present
     const headers = parseEmailHeaders(body.headers || '');
 
-    // Extract attachments from multipart files
-    const attachments: Array<{ filename: string; content: string; contentType: string; contentId?: string; size: number }> = [];
+    // Collect raw attachment metadata (keep the buffer, DON'T base64 yet) so the
+    // size budget is applied before we pay the base64 cost on files we'll drop.
+    const rawAttachments: Array<{ filename: string; buffer: Buffer; contentType: string; contentId?: string; size: number }> = [];
     if (req.files && Array.isArray(req.files)) {
       for (const file of req.files as Express.Multer.File[]) {
         // SendGrid attachment fields are named 'attachment1', 'attachment2', etc.
@@ -69,17 +104,35 @@ router.post('/sendgrid', upload.any(), async (req: Request, res: Response) => {
             }
           }
 
-          attachments.push({
+          rawAttachments.push({
             filename: file.originalname || 'attachment',
-            content: file.buffer.toString('base64'),
+            buffer: file.buffer,
             contentType: file.mimetype || 'application/octet-stream',
-            contentId: contentId,
+            contentId,
             size: file.size,
           });
         }
       }
     }
-    console.log(`[InboundRoutes:SendGrid] Total attachments: ${attachments.length}`);
+
+    // Apply the size budget on RAW bytes, then base64-encode only the kept files.
+    const { kept, skipped } = applyAttachmentBudget(rawAttachments);
+    if (skipped.length > 0) {
+      // Metadata only (filename + raw size), never attachment content.
+      console.warn(
+        `[InboundRoutes:SendGrid] Dropped ${skipped.length} attachment(s) over size budget ` +
+          `(per-file ${MAX_ATTACHMENT_BYTES}B, total ${MAX_TOTAL_ATTACHMENT_BYTES}B): ` +
+          skipped.map((s) => `${s.filename}=${s.size}B`).join(', '),
+      );
+    }
+    const attachments = kept.map((a) => ({
+      filename: a.filename,
+      content: a.buffer.toString('base64'),
+      contentType: a.contentType,
+      contentId: a.contentId,
+      size: a.size,
+    }));
+    console.log(`[InboundRoutes:SendGrid] Attachments kept: ${attachments.length}, skipped: ${skipped.length}`);
 
     // SendGrid sender-authentication fields, forwarded verbatim to PSA.
     const spf: string | undefined = body.SPF;
@@ -95,6 +148,7 @@ router.post('/sendgrid', upload.any(), async (req: Request, res: Response) => {
       html: body.html || '',
       headers: headers,
       attachments: attachments,
+      skippedAttachments: skipped,
       envelope: envelope,
       spf,
       dkim,
